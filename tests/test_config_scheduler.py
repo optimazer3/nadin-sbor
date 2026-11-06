@@ -12,7 +12,7 @@ BASE_ENV = {
     "BOT_TOKEN": "42:TEST",
     "ADMIN_IDS": "111, 222",
     "SUPABASE_URL": "https://x.supabase.co",
-    "SUPABASE_KEY": "key",
+    "SUPABASE_KEY": "sb_secret_test",
     "ASSEMBLYAI_API_KEY": "aai",
     "LLM_API_KEY": "polza-test",
     "TEAM_MEMBERS": "Иван, Мария, Иван, ",

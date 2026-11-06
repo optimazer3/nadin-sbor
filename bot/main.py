@@ -16,6 +16,7 @@ from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
+from postgrest.exceptions import APIError
 from supabase import AsyncClientOptions, acreate_client
 
 from bot.config import ConfigError, Settings, load_settings
@@ -25,6 +26,7 @@ from bot.repository import SupabaseTaskRepository
 from bot.scheduler import setup_scheduler
 from bot.services.task_parser import TaskParser
 from bot.services.transcriber import AssemblyAITranscriber, TranscriptionError
+from bot.supabase_key import WHERE, inspect_key, project_ref
 
 log = logging.getLogger("bot")
 
@@ -80,14 +82,37 @@ async def _check_assemblyai(transcriber: AssemblyAITranscriber) -> None:
         log.info("AssemblyAI: ключ принят")
 
 
-async def _check_supabase(repo: SupabaseTaskRepository) -> None:
+async def _check_supabase(repo: SupabaseTaskRepository, settings: Settings) -> None:
+    info = inspect_key(settings.supabase_key, settings.supabase_url)
+    log.info("Supabase: ключ %s", info.describe())
     try:
         await repo.check()
+    except APIError as exc:
+        message = exc.message or str(exc)
+        if "Legacy API keys are disabled" in message:
+            raise StartupError(
+                "Supabase: в проекте отключены старые ключи (service_role eyJ…). "
+                "Возьмите Secret key: Project Settings → API Keys → вкладка «API Keys» → Secret keys "
+                "(начинается с sb_secret_…)"
+            ) from exc
+        if "Invalid API key" in message or "JWT" in message:
+            raise StartupError(
+                f"Supabase не принял ключ ({message}).\n"
+                f"Сейчас в SUPABASE_KEY: {info.describe()}.\n"
+                f"Откройте в Supabase проект {project_ref(settings.supabase_url) or ''} → {WHERE}. "
+                "Нажмите Copy и вставьте ключ в .env целиком, одной строкой, без кавычек. "
+                "Сверьте начало и конец ключа с тем, что выше. Если не помогает — возьмите ключ "
+                "с другой вкладки (sb_secret_… вместо eyJ… или наоборот)"
+            ) from exc
+        if exc.code in {"42P01", "PGRST205"} or "does not exist" in message or "schema cache" in message:
+            raise StartupError(
+                f"Supabase: таблицы tasks нет ({message}). Выполните файл supabase/schema.sql "
+                "в SQL Editor (README, шаг 4.2)"
+            ) from exc
+        raise StartupError(f"Supabase вернул ошибку: {message}") from exc
     except Exception as exc:
         raise StartupError(
-            f"Не удалось прочитать таблицу tasks в Supabase: {exc}\n"
-            "Проверьте SUPABASE_URL и SUPABASE_KEY (нужен ключ service_role / secret) "
-            "и что в SQL Editor выполнен файл supabase/schema.sql"
+            f"Не удалось подключиться к Supabase: {exc!r}\nПроверьте SUPABASE_URL и прокси (PROXY_URL)"
         ) from exc
     log.info("Supabase: таблица tasks доступна")
 
@@ -128,7 +153,7 @@ async def main() -> None:
             options=AsyncClientOptions(httpx_client=sb_http) if sb_http else None,
         )
         repo = SupabaseTaskRepository(supabase)
-        await _check_supabase(repo)
+        await _check_supabase(repo, settings)
         await _check_assemblyai(transcriber)
 
         parser = TaskParser(

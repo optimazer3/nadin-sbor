@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import json
 import logging
 import os
 from dataclasses import dataclass
@@ -14,6 +12,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from bot.proxy import Proxy, ProxyError, parse_services
+from bot.supabase_key import SupabaseKeyError, clean_key, inspect_key
 
 log = logging.getLogger(__name__)
 
@@ -85,22 +84,13 @@ def _parse_admin_ids(raw: str) -> frozenset[int]:
     return frozenset(ids)
 
 
-def _check_supabase_key(key: str) -> str:
-    """Не даём по ошибке подставить публичный ключ (anon / publishable) вместо service_role."""
-    wrong = (
-        "SUPABASE_KEY: это публичный ключ ({kind}). Боту нужен секретный ключ: "
-        "service_role (вкладка Legacy API Keys) или Secret key sb_secret_… (вкладка API Keys)"
-    )
-    if key.startswith("sb_publishable_"):
-        raise ConfigError(wrong.format(kind="publishable"))
-    if key.startswith("eyJ") and key.count(".") == 2:  # старый формат ключа — JWT
-        try:
-            payload = key.split(".")[1]
-            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        except (ValueError, json.JSONDecodeError):
-            return key
-        if claims.get("role") == "anon":
-            raise ConfigError(wrong.format(kind="anon"))
+def _check_supabase_key(raw_key: str, url: str) -> str:
+    """Чистит ключ от кавычек/пробелов и не даёт подставить anon, чужой или битый ключ."""
+    key = clean_key(raw_key)
+    try:
+        inspect_key(key, url)
+    except SupabaseKeyError as exc:
+        raise ConfigError(str(exc)) from exc
     return key
 
 
@@ -178,12 +168,13 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         raise ConfigError(f"TIMEZONE: неизвестный часовой пояс «{tz_name}»") from exc
 
     proxy, proxy_services = _parse_proxy()
+    supabase_url = _required("SUPABASE_URL").rstrip("/")
 
     return Settings(
         bot_token=_required("BOT_TOKEN"),
         admin_ids=_parse_admin_ids(_required("ADMIN_IDS")),
-        supabase_url=_required("SUPABASE_URL"),
-        supabase_key=_check_supabase_key(_required("SUPABASE_KEY")),
+        supabase_url=supabase_url,
+        supabase_key=_check_supabase_key(_required("SUPABASE_KEY"), supabase_url),
         assemblyai_api_key=_required("ASSEMBLYAI_API_KEY"),
         assemblyai_base_url=os.getenv("ASSEMBLYAI_BASE_URL", "").strip() or "https://api.assemblyai.com",
         assemblyai_language=os.getenv("ASSEMBLYAI_LANGUAGE", "").strip() or "ru",

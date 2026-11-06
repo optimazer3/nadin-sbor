@@ -105,9 +105,8 @@ class FakeParser:
         return self.date_answer
 
 
-@pytest.fixture
-def env():
-    settings = Settings(
+def make_settings(**overrides) -> Settings:
+    values = dict(
         bot_token="42:TEST",
         admin_ids=frozenset({ADMIN}),
         supabase_url="",
@@ -124,6 +123,13 @@ def env():
         reminder_day="mon",
         reminder_time=time(10, 0),
     )
+    values.update(overrides)
+    return Settings(**values)
+
+
+@pytest.fixture
+def env():
+    settings = make_settings()
     session = FakeSession()
     bot = Bot("42:TEST", session=session)
     repo = InMemoryTaskRepository()
