@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import time
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+
+log = logging.getLogger(__name__)
 
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
@@ -99,10 +103,51 @@ def _parse_time(raw: str) -> time:
         raise ConfigError(f"REMINDER_TIME: «{raw}» — ожидается формат ЧЧ:ММ") from exc
 
 
+def find_env_file(name: str = ".env") -> Path | None:
+    """Ищет .env в папке запуска.
+
+    Блокнот в Windows часто сохраняет файл как «.env.txt», а Проводник прячет расширение,
+    поэтому такой файл тоже принимаем (и предупреждаем в логе).
+    """
+    path = Path(name)
+    if path.is_file():
+        return path
+    for alt in (path.with_name(path.name + ".txt"), path.with_name(path.name.lstrip(".") + ".txt")):
+        if alt.is_file():
+            log.warning(
+                "Файл %s не найден, читаю настройки из %s. Лучше переименуйте его в %s",
+                path.name,
+                alt.name,
+                path.name,
+            )
+            return alt
+    return None
+
+
+def _load_env_file(path: Path) -> None:
+    # utf-8-sig понимает и обычный UTF-8, и UTF-8 с BOM (так сохраняют некоторые редакторы);
+    # cp1251 — кодировка «ANSI» старого Блокнота в русской Windows.
+    for encoding in ("utf-8-sig", "cp1251"):
+        try:
+            path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+        load_dotenv(path, encoding=encoding)
+        return
+    raise ConfigError(f"Не удалось прочитать {path.name}: сохраните файл в кодировке UTF-8")
+
+
 def load_settings(env_file: str | None = ".env") -> Settings:
-    """Читает настройки. env_file — путь к .env относительно папки запуска (None — не читать)."""
+    """Читает настройки. env_file — имя .env в папке запуска (None — не читать файл)."""
     if env_file:
-        load_dotenv(env_file)
+        found = find_env_file(env_file)
+        if found is not None:
+            _load_env_file(found)
+        elif not os.getenv("BOT_TOKEN"):
+            raise ConfigError(
+                f"Не найден файл {env_file} в папке {Path.cwd()}. Создайте его из .env.example "
+                "(см. README, шаг 8) и запускайте бота из папки проекта"
+            )
 
     reminder_day = os.getenv("REMINDER_DAY", "mon").strip().lower()
     if reminder_day not in WEEKDAYS:

@@ -98,3 +98,36 @@ def test_supabase_public_keys_rejected(env, key):
     env.setenv("SUPABASE_KEY", key)
     with pytest.raises(ConfigError, match="service_role"):
         load_settings(env_file=None)
+
+
+ENV_TEXT = "\n".join(f"{k}={v}" for k, v in BASE_ENV.items()) + "\nTEAM_MEMBERS=Иван,Мария\n"
+
+
+@pytest.fixture
+def clean_env(monkeypatch, tmp_path):
+    """Пустое окружение и пустая папка запуска — настройки берутся только из файла."""
+    for key in [*BASE_ENV, "TIMEZONE", "REMINDER_DAY", "REMINDER_TIME", "LLM_MODEL", "LLM_BASE_URL"]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+@pytest.mark.parametrize("filename", [".env", ".env.txt", "env.txt"])
+def test_env_file_names(clean_env, filename):
+    (clean_env / filename).write_text(ENV_TEXT, encoding="utf-8")
+    s = load_settings()
+    assert s.bot_token == "42:TEST"
+    assert s.team_members == ("Иван", "Мария")
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "cp1251"])
+def test_env_file_encodings(clean_env, encoding):
+    (clean_env / ".env").write_text(ENV_TEXT, encoding=encoding)
+    s = load_settings()
+    assert s.bot_token == "42:TEST"
+    assert s.team_members == ("Иван", "Мария")
+
+
+def test_env_file_missing(clean_env):
+    with pytest.raises(ConfigError, match="Не найден файл .env"):
+        load_settings()
