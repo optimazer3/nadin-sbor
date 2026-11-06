@@ -283,6 +283,7 @@ async def test_supabase_through_socks5_without_socks5h(serve):
     """Настоящий httpx-клиент через обычный socks5:// (как на старых версиях httpx)."""
     p = await Socks5Proxy().start()
     app = web.Application()
+
     async def tasks(request):
         return web.json_response([])
 
