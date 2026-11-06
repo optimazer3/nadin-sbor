@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 import aiohttp
+from aiohttp_socks import ProxyConnectionError, ProxyConnector, ProxyError, ProxyTimeoutError
 
 log = logging.getLogger(__name__)
 
@@ -30,8 +31,10 @@ class AssemblyAITranscriber:
         speech_model: str | None = None,
         poll_interval: float = 1.5,
         timeout: float = 300.0,
+        proxy: str | None = None,
     ) -> None:
         self._api_key = api_key
+        self._proxy = proxy
         self._base_url = base_url.rstrip("/")
         self._language_code = language_code
         self._speech_model = speech_model
@@ -41,10 +44,12 @@ class AssemblyAITranscriber:
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            connector = ProxyConnector.from_url(self._proxy, rdns=True) if self._proxy else None
             self._session = aiohttp.ClientSession(
                 headers={"authorization": self._api_key},
                 timeout=aiohttp.ClientTimeout(total=60),
-                trust_env=True,  # учитывать HTTPS_PROXY, если он задан
+                connector=connector,
+                trust_env=not self._proxy,  # без PROXY_URL учитываем HTTPS_PROXY из окружения
             )
         return self._session
 
@@ -57,13 +62,22 @@ class AssemblyAITranscriber:
         url = f"{self._base_url}{path}"
         try:
             async with session.request(method, url, **kwargs) as resp:
-                payload = await resp.json(content_type=None)
+                try:
+                    payload = await resp.json(content_type=None)
+                except ValueError:
+                    raise TranscriptionError(f"AssemblyAI {resp.status}: ответ не в формате JSON") from None
                 if resp.status >= 400:
                     message = payload.get("error") if isinstance(payload, dict) else payload
                     raise TranscriptionError(f"AssemblyAI {resp.status}: {message}")
                 return payload
-        except aiohttp.ClientError as exc:
-            raise TranscriptionError(f"Сетевая ошибка AssemblyAI: {exc}") from exc
+        except (ProxyError, ProxyConnectionError, ProxyTimeoutError) as exc:
+            raise TranscriptionError(f"Не удалось подключиться через прокси: {exc}") from exc
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise TranscriptionError(f"Сетевая ошибка AssemblyAI: {exc!r}") from exc
+
+    async def check(self) -> None:
+        """Проверка при запуске: есть связь и ключ принят (иначе TranscriptionError)."""
+        await self._request("GET", "/v2/transcript", params={"limit": 1})
 
     async def transcribe(self, audio: bytes) -> str:
         if not audio:

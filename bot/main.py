@@ -6,14 +6,17 @@ import asyncio
 import logging
 import sys
 
+import httpx
 import openai
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
-from supabase import acreate_client
+from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
+from supabase import AsyncClientOptions, acreate_client
 
 from bot.config import ConfigError, Settings, load_settings
 from bot.handlers import get_routers
@@ -21,7 +24,7 @@ from bot.middlewares import AdminOnlyMiddleware
 from bot.repository import SupabaseTaskRepository
 from bot.scheduler import setup_scheduler
 from bot.services.task_parser import TaskParser
-from bot.services.transcriber import AssemblyAITranscriber
+from bot.services.transcriber import AssemblyAITranscriber, TranscriptionError
 
 log = logging.getLogger("bot")
 
@@ -39,14 +42,42 @@ class StartupError(RuntimeError):
     pass
 
 
-async def _check_telegram(bot: Bot) -> None:
+async def _check_telegram(bot: Bot, settings: Settings) -> None:
+    proxy = settings.proxy_for("telegram")
     try:
         me = await bot.get_me()
     except TelegramUnauthorizedError as exc:
         raise StartupError("Telegram не принял BOT_TOKEN — проверьте токен от @BotFather") from exc
-    except TelegramNetworkError as exc:
-        raise StartupError(f"Нет связи с Telegram: {exc}") from exc
+    except (
+        TelegramNetworkError,
+        ProxyError,
+        ProxyConnectionError,
+        ProxyTimeoutError,
+        OSError,
+        TimeoutError,
+    ) as exc:
+        if proxy:
+            raise StartupError(
+                f"Не удалось подключиться к Telegram через прокси {proxy}: {exc}\n"
+                "Проверьте, что Happ запущен и подключён к серверу, и что порт в PROXY_URL "
+                "совпадает с портом в настройках Happ (см. README, шаг «Прокси»)"
+            ) from exc
+        raise StartupError(
+            f"Нет связи с Telegram: {exc}\n"
+            "Из России Telegram API без прокси недоступен: включите Happ и укажите PROXY_URL "
+            "в .env (см. README, шаг «Прокси»)"
+        ) from exc
     log.info("Telegram: бот @%s", me.username)
+
+
+async def _check_assemblyai(transcriber: AssemblyAITranscriber) -> None:
+    # Без AssemblyAI бот всё равно работает с текстом, поэтому здесь только предупреждение.
+    try:
+        await transcriber.check()
+    except TranscriptionError as exc:
+        log.warning("AssemblyAI недоступен — голосовые распознаваться не будут: %s", exc)
+    else:
+        log.info("AssemblyAI: ключ принят")
 
 
 async def _check_supabase(repo: SupabaseTaskRepository) -> None:
@@ -63,23 +94,50 @@ async def _check_supabase(repo: SupabaseTaskRepository) -> None:
 
 async def main() -> None:
     settings = load_settings()
-    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    if settings.proxy:
+        log.info("Прокси %s для: %s", settings.proxy, ", ".join(sorted(settings.proxy_services)))
+    else:
+        log.info("Прокси не задан (PROXY_URL) — подключаюсь напрямую")
+
+    tg_proxy = settings.proxy_for("telegram")
+    bot = Bot(
+        settings.bot_token,
+        session=AiohttpSession(proxy=tg_proxy.aiohttp_url) if tg_proxy else None,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    aai_proxy = settings.proxy_for("assemblyai")
     transcriber = AssemblyAITranscriber(
         api_key=settings.assemblyai_api_key,
         base_url=settings.assemblyai_base_url,
         language_code=settings.assemblyai_language,
         speech_model=settings.assemblyai_speech_model,
+        proxy=aai_proxy.aiohttp_url if aai_proxy else None,
     )
+    sb_proxy = settings.proxy_for("supabase")
+    sb_http = httpx.AsyncClient(proxy=sb_proxy.httpx_url, timeout=30.0) if sb_proxy else None
+    llm_proxy = settings.proxy_for("llm")
+    llm_http = openai.DefaultAsyncHttpxClient(proxy=llm_proxy.httpx_url) if llm_proxy else None
+
     scheduler = None
     try:
-        await _check_telegram(bot)
+        await _check_telegram(bot, settings)
 
-        supabase = await acreate_client(settings.supabase_url, settings.supabase_key)
+        supabase = await acreate_client(
+            settings.supabase_url,
+            settings.supabase_key,
+            options=AsyncClientOptions(httpx_client=sb_http) if sb_http else None,
+        )
         repo = SupabaseTaskRepository(supabase)
         await _check_supabase(repo)
+        await _check_assemblyai(transcriber)
 
         parser = TaskParser(
-            openai.AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url, timeout=60.0),
+            openai.AsyncOpenAI(
+                api_key=settings.llm_api_key,
+                base_url=settings.llm_base_url,
+                timeout=60.0,
+                http_client=llm_http,
+            ),
             model=settings.llm_model,
             team_members=settings.team_members,
         )
@@ -108,6 +166,9 @@ async def main() -> None:
             scheduler.shutdown(wait=False)
         await transcriber.close()
         await bot.session.close()
+        for client in (sb_http, llm_http):
+            if client is not None:
+                await client.aclose()
 
 
 def run() -> None:

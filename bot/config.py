@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
+from bot.proxy import Proxy, ProxyError, parse_services
+
 log = logging.getLogger(__name__)
 
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -43,6 +45,22 @@ class Settings:
     timezone: ZoneInfo
     reminder_day: str
     reminder_time: time
+    proxy: Proxy | None = None
+    proxy_services: frozenset[str] = frozenset()
+
+    def proxy_for(self, service: str) -> Proxy | None:
+        """Прокси для сервиса (telegram / assemblyai / supabase / llm) или None — напрямую."""
+        return self.proxy if self.proxy and service in self.proxy_services else None
+
+
+def _parse_proxy() -> tuple[Proxy | None, frozenset[str]]:
+    raw = os.getenv("PROXY_URL", "").strip()
+    if not raw:
+        return None, frozenset()
+    try:
+        return Proxy.parse(raw), parse_services(os.getenv("PROXY_SERVICES"))
+    except ProxyError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _required(name: str) -> str:
@@ -159,6 +177,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
     except Exception as exc:  # ZoneInfoNotFoundError / ValueError
         raise ConfigError(f"TIMEZONE: неизвестный часовой пояс «{tz_name}»") from exc
 
+    proxy, proxy_services = _parse_proxy()
+
     return Settings(
         bot_token=_required("BOT_TOKEN"),
         admin_ids=_parse_admin_ids(_required("ADMIN_IDS")),
@@ -175,4 +195,6 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         timezone=tz,
         reminder_day=reminder_day,
         reminder_time=_parse_time(os.getenv("REMINDER_TIME", "10:00")),
+        proxy=proxy,
+        proxy_services=proxy_services,
     )
