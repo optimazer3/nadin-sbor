@@ -5,13 +5,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, TypeVar
 from urllib.parse import quote, unquote, urlsplit
 
 # Сервисы, которые можно пустить через прокси. Polza AI — российский сервис,
 # поэтому по умолчанию к нему ходим напрямую.
 SERVICES = ("telegram", "assemblyai", "supabase", "llm")
 DEFAULT_SERVICES = ("telegram", "assemblyai", "supabase")
+
+T = TypeVar("T")
 
 _SCHEMES = {"socks5": "socks5", "socks5h": "socks5", "socks": "socks5", "http": "http"}
 
@@ -69,6 +73,24 @@ class Proxy:
     def httpx_url(self) -> str:
         """Для httpx (Supabase, нейросеть): socks5h — DNS-имена резолвит прокси."""
         return self._url("socks5h" if self.scheme == "socks5" else "http")
+
+    @property
+    def httpx_url_fallback(self) -> str:
+        """Для старых httpx (< 0.28), которые не знают socks5h: имена резолвит компьютер."""
+        return self._url(self.scheme)
+
+    def httpx_client(self, factory: Callable[..., T], **kwargs: Any) -> T:
+        """Создаёт httpx-клиент (httpx.AsyncClient и т.п.) с этим прокси.
+
+        Сначала пробуем socks5h; если установленная версия httpx его не знает
+        («Unknown scheme for proxy URL»), берём обычный socks5.
+        """
+        try:
+            return factory(proxy=self.httpx_url, **kwargs)
+        except ValueError:
+            if self.httpx_url == self.httpx_url_fallback:
+                raise
+            return factory(proxy=self.httpx_url_fallback, **kwargs)
 
     def __str__(self) -> str:  # без пароля — для логов
         return f"{self.scheme}://{self.host}:{self.port}"

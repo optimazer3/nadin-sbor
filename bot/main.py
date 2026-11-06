@@ -114,9 +114,9 @@ async def main() -> None:
         proxy=aai_proxy.aiohttp_url if aai_proxy else None,
     )
     sb_proxy = settings.proxy_for("supabase")
-    sb_http = httpx.AsyncClient(proxy=sb_proxy.httpx_url, timeout=30.0) if sb_proxy else None
+    sb_http = sb_proxy.httpx_client(httpx.AsyncClient, timeout=30.0) if sb_proxy else None
     llm_proxy = settings.proxy_for("llm")
-    llm_http = openai.DefaultAsyncHttpxClient(proxy=llm_proxy.httpx_url) if llm_proxy else None
+    llm_http = llm_proxy.httpx_client(openai.DefaultAsyncHttpxClient) if llm_proxy else None
 
     scheduler = None
     try:

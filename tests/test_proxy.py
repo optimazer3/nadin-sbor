@@ -254,3 +254,47 @@ async def test_llm_through_proxy(proxy, serve):
         await http.aclose()
     assert draft.title == "A"
     assert ("localhost", port) in proxy.targets
+
+
+def test_httpx_client_falls_back_for_old_httpx():
+    """httpx < 0.28 падает на socks5h с ValueError — тогда берём socks5."""
+    calls = []
+
+    def old_httpx_client(proxy, **kwargs):
+        calls.append(proxy)
+        if proxy.startswith("socks5h://"):
+            raise ValueError(f"Unknown scheme for proxy URL URL('{proxy}')")
+        return ("client", proxy, kwargs)
+
+    client = Proxy.parse("socks5://127.0.0.1:10808").httpx_client(old_httpx_client, timeout=30.0)
+    assert client == ("client", "socks5://127.0.0.1:10808", {"timeout": 30.0})
+    assert calls == ["socks5h://127.0.0.1:10808", "socks5://127.0.0.1:10808"]
+
+
+def test_httpx_client_http_proxy_error_is_not_swallowed():
+    def broken(proxy, **kwargs):
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        Proxy.parse("http://127.0.0.1:10809").httpx_client(broken)
+
+
+async def test_supabase_through_socks5_without_socks5h(serve):
+    """Настоящий httpx-клиент через обычный socks5:// (как на старых версиях httpx)."""
+    p = await Socks5Proxy().start()
+    app = web.Application()
+    async def tasks(request):
+        return web.json_response([])
+
+    app.router.add_get("/rest/v1/tasks", tasks)
+    port = await serve(app)
+    http = httpx.AsyncClient(proxy=Proxy.parse(p.url).httpx_url_fallback)
+    try:
+        client = await acreate_client(
+            f"http://localhost:{port}", "sb_secret_test", options=AsyncClientOptions(httpx_client=http)
+        )
+        await SupabaseTaskRepository(client).check()
+    finally:
+        await http.aclose()
+        await p.close()
+    assert ("127.0.0.1", port) in p.targets or ("localhost", port) in p.targets
