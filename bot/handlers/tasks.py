@@ -374,7 +374,7 @@ async def on_deadline_input(
         try:
             deadline = await parser.parse_date(text, today)
         except TaskParserError as exc:
-            log.warning("Не удалось разобрать дату через Claude: %s", exc)
+            log.warning("Не удалось разобрать дату через нейросеть: %s", exc)
             deadline = None
         if deadline is None:
             await message.answer(

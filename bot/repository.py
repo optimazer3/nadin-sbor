@@ -87,6 +87,10 @@ class SupabaseTaskRepository:
         resp = await self._t().insert(rows).execute()
         return sorted((Task.from_row(r) for r in resp.data), key=lambda t: t.id)
 
+    async def check(self) -> None:
+        """Проверка при запуске: ключ подходит и таблица существует (иначе исключение)."""
+        await self._t().select("id").limit(1).execute()
+
     async def get(self, task_id: int) -> Task | None:
         resp = await self._t().select("*").eq("id", task_id).limit(1).execute()
         return Task.from_row(resp.data[0]) if resp.data else None

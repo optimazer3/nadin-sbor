@@ -14,15 +14,21 @@ BASE_ENV = {
     "SUPABASE_URL": "https://x.supabase.co",
     "SUPABASE_KEY": "key",
     "ASSEMBLYAI_API_KEY": "aai",
-    "ANTHROPIC_API_KEY": "sk-ant-test",
+    "LLM_API_KEY": "polza-test",
     "TEAM_MEMBERS": "Иван, Мария, Иван, ",
 }
 
 
 @pytest.fixture
-def env(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)  # чтобы не подхватился настоящий .env
-    for key in ["TIMEZONE", "REMINDER_DAY", "REMINDER_TIME", "ANTHROPIC_MODEL", "ASSEMBLYAI_SPEECH_MODEL"]:
+def env(monkeypatch):
+    for key in [
+        "TIMEZONE",
+        "REMINDER_DAY",
+        "REMINDER_TIME",
+        "LLM_MODEL",
+        "LLM_BASE_URL",
+        "ASSEMBLYAI_SPEECH_MODEL",
+    ]:
         monkeypatch.delenv(key, raising=False)
     for key, value in BASE_ENV.items():
         monkeypatch.setenv(key, value)
@@ -30,12 +36,14 @@ def env(monkeypatch, tmp_path):
 
 
 def test_load_settings_defaults(env):
-    s = load_settings()
+    s = load_settings(env_file=None)
     assert s.admin_ids == {111, 222}
     assert s.team_members == ("Иван", "Мария")
     assert s.timezone == MSK
     assert (s.reminder_day, s.reminder_time) == ("mon", time(10, 0))
-    assert s.anthropic_model == "claude-opus-5-5"
+    assert s.llm_model == "openai/gpt-4.1-mini"
+    assert s.llm_base_url == "https://api.polza.ai/api/v1"
+    assert s.llm_api_key == "polza-test"
     assert s.assemblyai_speech_model is None
 
 
@@ -46,17 +54,18 @@ def test_load_settings_defaults(env):
 def test_load_settings_errors(env, key, value):
     env.setenv(key, value)
     with pytest.raises(ConfigError):
-        load_settings()
+        load_settings(env_file=None)
 
 
-def test_missing_required(env):
-    env.delenv("BOT_TOKEN")
-    with pytest.raises(ConfigError, match="BOT_TOKEN"):
-        load_settings()
+@pytest.mark.parametrize("key", ["BOT_TOKEN", "LLM_API_KEY", "SUPABASE_KEY"])
+def test_missing_required(env, key):
+    env.delenv(key)
+    with pytest.raises(ConfigError, match=key):
+        load_settings(env_file=None)
 
 
 def test_weekly_job_fires_monday_10_msk(env):
-    settings = load_settings()
+    settings = load_settings(env_file=None)
     scheduler = setup_scheduler(bot=None, repo=None, settings=settings)
     job = scheduler.get_job("weekly_dashboard")
     now = datetime(2026, 11, 6, 15, 0, tzinfo=MSK)  # пятница
@@ -66,3 +75,26 @@ def test_weekly_job_fires_monday_10_msk(env):
     # Ровно в понедельник 10:00 следующая отправка — через неделю.
     after = job.trigger.get_next_fire_time(fire, fire.replace(minute=1))
     assert after == datetime(2026, 11, 16, 10, 0, tzinfo=MSK)
+
+
+def _jwt(role: str) -> str:
+    import base64
+    import json
+
+    def part(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    return f"{part({'alg': 'HS256'})}.{part({'iss': 'supabase', 'role': role})}.signature"
+
+
+@pytest.mark.parametrize("key", [_jwt("service_role"), "sb_secret_abc123"])
+def test_supabase_secret_keys_accepted(env, key):
+    env.setenv("SUPABASE_KEY", key)
+    assert load_settings(env_file=None).supabase_key == key
+
+
+@pytest.mark.parametrize("key", [_jwt("anon"), "sb_publishable_abc123"])
+def test_supabase_public_keys_rejected(env, key):
+    env.setenv("SUPABASE_KEY", key)
+    with pytest.raises(ConfigError, match="service_role"):
+        load_settings(env_file=None)

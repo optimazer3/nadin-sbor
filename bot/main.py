@@ -6,10 +6,11 @@ import asyncio
 import logging
 import sys
 
-import anthropic
+import openai
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 from supabase import acreate_client
@@ -34,45 +35,77 @@ def build_dispatcher(settings: Settings, **deps) -> Dispatcher:
     return dp
 
 
+class StartupError(RuntimeError):
+    pass
+
+
+async def _check_telegram(bot: Bot) -> None:
+    try:
+        me = await bot.get_me()
+    except TelegramUnauthorizedError as exc:
+        raise StartupError("Telegram не принял BOT_TOKEN — проверьте токен от @BotFather") from exc
+    except TelegramNetworkError as exc:
+        raise StartupError(f"Нет связи с Telegram: {exc}") from exc
+    log.info("Telegram: бот @%s", me.username)
+
+
+async def _check_supabase(repo: SupabaseTaskRepository) -> None:
+    try:
+        await repo.check()
+    except Exception as exc:
+        raise StartupError(
+            f"Не удалось прочитать таблицу tasks в Supabase: {exc}\n"
+            "Проверьте SUPABASE_URL и SUPABASE_KEY (нужен ключ service_role / secret) "
+            "и что в SQL Editor выполнен файл supabase/schema.sql"
+        ) from exc
+    log.info("Supabase: таблица tasks доступна")
+
+
 async def main() -> None:
     settings = load_settings()
-
-    supabase = await acreate_client(settings.supabase_url, settings.supabase_key)
-    repo = SupabaseTaskRepository(supabase)
+    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     transcriber = AssemblyAITranscriber(
         api_key=settings.assemblyai_api_key,
         base_url=settings.assemblyai_base_url,
         language_code=settings.assemblyai_language,
         speech_model=settings.assemblyai_speech_model,
     )
-    parser = TaskParser(
-        anthropic.AsyncAnthropic(timeout=90.0),
-        model=settings.anthropic_model,
-        team_members=settings.team_members,
-    )
-
-    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = build_dispatcher(settings, repo=repo, transcriber=transcriber, parser=parser)
-
-    scheduler = setup_scheduler(bot, repo, settings)
-    scheduler.start()
-    job = scheduler.get_job("weekly_dashboard")
-    log.info("Еженедельный дашборд: следующая отправка %s", job.next_run_time if job else "—")
-
-    await bot.set_my_commands(
-        [
-            BotCommand(command="tasks", description="Список задач"),
-            BotCommand(command="dashboard", description="Дашборд активных задач"),
-            BotCommand(command="cancel", description="Отменить текущее действие"),
-            BotCommand(command="help", description="Как пользоваться"),
-        ]
-    )
-
+    scheduler = None
     try:
-        log.info("Бот запущен. Остановить — Ctrl+C")
+        await _check_telegram(bot)
+
+        supabase = await acreate_client(settings.supabase_url, settings.supabase_key)
+        repo = SupabaseTaskRepository(supabase)
+        await _check_supabase(repo)
+
+        parser = TaskParser(
+            openai.AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url, timeout=60.0),
+            model=settings.llm_model,
+            team_members=settings.team_members,
+        )
+        log.info("Нейросеть: модель %s через %s", settings.llm_model, settings.llm_base_url)
+
+        dp = build_dispatcher(settings, repo=repo, transcriber=transcriber, parser=parser)
+
+        scheduler = setup_scheduler(bot, repo, settings)
+        scheduler.start()
+        job = scheduler.get_job("weekly_dashboard")
+        log.info("Еженедельный дашборд: следующая отправка %s", job.next_run_time if job else "—")
+
+        await bot.set_my_commands(
+            [
+                BotCommand(command="tasks", description="Список задач"),
+                BotCommand(command="dashboard", description="Дашборд активных задач"),
+                BotCommand(command="cancel", description="Отменить текущее действие"),
+                BotCommand(command="help", description="Как пользоваться"),
+            ]
+        )
+
+        log.info("Бот запущен. Напишите ему /start в Telegram. Остановить — Ctrl+C")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        scheduler.shutdown(wait=False)
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
         await transcriber.close()
         await bot.session.close()
 
@@ -85,7 +118,10 @@ def run() -> None:
     try:
         asyncio.run(main())
     except ConfigError as exc:
-        log.error("Ошибка конфигурации: %s", exc)
+        log.error("Ошибка в настройках (.env): %s", exc)
+        sys.exit(1)
+    except StartupError as exc:
+        log.error("Бот не запустился: %s", exc)
         sys.exit(1)
     except KeyboardInterrupt:
         pass

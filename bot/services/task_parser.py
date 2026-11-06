@@ -1,66 +1,24 @@
-"""Разбор текста (или расшифровки голосового) в задачи через Claude API."""
+"""Разбор текста (или расшифровки голосового) в задачи через нейросеть.
+
+Используется OpenAI-совместимый API (Chat Completions), поэтому подходит Polza AI,
+OpenAI напрямую и любой другой сервис с таким же форматом: меняются только
+LLM_BASE_URL, LLM_API_KEY и LLM_MODEL в .env.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date
 from typing import Any
 
-import anthropic
+import openai
 
 from bot.dates import WEEKDAY_FULL, calendar_hint
 from bot.models import TaskDraft
 
 log = logging.getLogger(__name__)
-
-# При отказе модели по соображениям безопасности API сам повторит запрос
-# на рекомендованной резервной модели (server-side fallback).
-_BETAS = ["server-side-fallback-2026-07-01"]
-
-_NULLABLE_STRING = {"anyOf": [{"type": "string"}, {"type": "null"}]}
-
-TASKS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "tasks": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Формулировка задачи без имени исполнителя и срока",
-                    },
-                    "assignee": {
-                        **_NULLABLE_STRING,
-                        "description": "Исполнитель в именительном падеже или null",
-                    },
-                    "deadline": {
-                        **_NULLABLE_STRING,
-                        "description": "Срок в формате YYYY-MM-DD или null",
-                    },
-                },
-                "required": ["title", "assignee", "deadline"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["tasks"],
-    "additionalProperties": False,
-}
-
-DATE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "deadline": {
-            **_NULLABLE_STRING,
-            "description": "Дата в формате YYYY-MM-DD или null, если дату понять нельзя",
-        }
-    },
-    "required": ["deadline"],
-    "additionalProperties": False,
-}
 
 _SYSTEM_TASKS = """\
 Ты помощник руководителя. Руководитель надиктовывает или пишет задачи для своей команды, \
@@ -83,20 +41,27 @@ _SYSTEM_TASKS = """\
 
 Если в сообщении несколько разных задач — верни их отдельными элементами. \
 Если в сообщении нет ни одной задачи (приветствие, вопрос, бессмыслица) — верни пустой список.
-{team_block}"""
+{team_block}
+Ответь только JSON-объектом, без пояснений, строго в таком формате:
+{{"tasks": [{{"title": "строка", "assignee": "строка или null", "deadline": "YYYY-MM-DD или null"}}]}}"""
 
 _TEAM_BLOCK = """
 Состав команды: {members}.
 Если исполнитель похож на кого-то из команды (другой падеж, уменьшительное имя, \
 ошибка распознавания: «Ване», «Машке», «Лёше») — запиши его имя ровно так, как оно указано \
-в составе команды. Если человека нет в списке — запиши имя как услышал, в именительном падеже."""
+в составе команды. Если человека нет в списке — запиши имя как услышал, в именительном падеже.
+"""
 
 _SYSTEM_DATE = """\
 Пользователь пишет срок выполнения задачи на русском языке. Определи дату по календарю \
-из сообщения и верни её в формате YYYY-MM-DD. «До пятницы» / «в пятницу» — ближайшая \
-пятница после сегодняшнего дня; «к концу недели» — пятница текущей недели (если она уже \
-прошла или сегодня — пятница следующей); «через неделю» — сегодня + 7 дней. \
-Если дату понять нельзя — верни null."""
+из сообщения. «До пятницы» / «в пятницу» — ближайшая пятница после сегодняшнего дня; \
+«к концу недели» — пятница текущей недели (если она уже прошла или сегодня — пятница \
+следующей); «через неделю» — сегодня + 7 дней; «к концу месяца» — последний день месяца.
+
+Ответь только JSON-объектом, без пояснений: {"deadline": "YYYY-MM-DD"} \
+или {"deadline": null}, если дату понять нельзя."""
+
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
 
 class TaskParserError(RuntimeError):
@@ -118,70 +83,102 @@ def _parse_iso(value: Any) -> date | None:
         return None
 
 
+def _extract_json(text: str) -> dict[str, Any]:
+    """Достаёт JSON-объект из ответа модели (в том числе из блока ```json ... ```)."""
+    cleaned = _FENCE_RE.sub("", text.strip())
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start == -1 or end <= start:
+            raise TaskParserError("Нейросеть вернула ответ не в формате JSON") from None
+        try:
+            data = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise TaskParserError("Нейросеть вернула некорректный JSON") from exc
+    if not isinstance(data, dict):
+        raise TaskParserError("Нейросеть вернула неожиданный формат ответа")
+    return data
+
+
 class TaskParser:
     def __init__(
         self,
-        client: anthropic.AsyncAnthropic,
-        model: str = "claude-opus-5-5",
+        client: openai.AsyncOpenAI,
+        model: str,
         team_members: tuple[str, ...] = (),
     ) -> None:
         self._client = client
         self._model = model
         team_block = _TEAM_BLOCK.format(members=", ".join(team_members)) if team_members else ""
         self._system_tasks = _SYSTEM_TASKS.format(team_block=team_block)
+        # Не все модели и сервисы поддерживают режим JSON; если запрос с ним отклонён,
+        # дальше спрашиваем без него (формат всё равно задан в инструкции).
+        self._json_mode = True
 
-    async def _ask(self, system: str, user_text: str, schema: dict[str, Any]) -> dict[str, Any]:
+    async def _complete(self, messages: list[dict[str, str]]) -> str:
+        kwargs: dict[str, Any] = {"model": self._model, "messages": messages}
+        if self._json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
         try:
-            response = await self._client.beta.messages.create(
-                model=self._model,
-                max_tokens=16000,
-                betas=_BETAS,
-                fallbacks="default",
-                # Простая задача извлечения — низкого усилия достаточно и это быстрее.
-                output_config={
-                    "effort": "low",
-                    "format": {"type": "json_schema", "schema": schema},
-                },
-                system=system,
-                messages=[{"role": "user", "content": user_text}],
-            )
-        except anthropic.APIConnectionError as exc:
-            raise TaskParserError(f"Нет связи с Claude API: {exc}") from exc
-        except anthropic.RateLimitError as exc:
-            raise TaskParserError("Claude API: превышен лимит запросов, попробуйте позже") from exc
-        except anthropic.APIStatusError as exc:
-            raise TaskParserError(f"Claude API {exc.status_code}: {exc.message}") from exc
+            response = await self._client.chat.completions.create(**kwargs)
+        except openai.BadRequestError:
+            if not self._json_mode:
+                raise
+            log.warning("Модель %s не приняла response_format=json_object — пробую без него", self._model)
+            self._json_mode = False
+            kwargs.pop("response_format")
+            response = await self._client.chat.completions.create(**kwargs)
 
-        if response.stop_reason == "refusal":
-            raise TaskParserError("Claude отказался обрабатывать это сообщение")
-        if response.stop_reason == "max_tokens":
-            raise TaskParserError("Ответ Claude оборвался (max_tokens)")
-
-        text = next((b.text for b in response.content if b.type == "text"), None)
+        if not response.choices:
+            raise TaskParserError("Нейросеть вернула пустой ответ")
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise TaskParserError("Ответ нейросети оборвался (слишком длинный)")
+        if choice.finish_reason == "content_filter":
+            raise TaskParserError("Нейросеть отказалась обрабатывать это сообщение")
+        text = (choice.message.content or "").strip()
         if not text:
-            raise TaskParserError("Claude вернул пустой ответ")
+            raise TaskParserError("Нейросеть вернула пустой ответ")
+        return text
+
+    async def _ask(self, system: str, user_text: str) -> dict[str, Any]:
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise TaskParserError("Claude вернул некорректный JSON") from exc
-        if not isinstance(data, dict):
-            raise TaskParserError("Claude вернул неожиданный формат ответа")
-        return data
+            text = await self._complete(messages)
+        except openai.AuthenticationError as exc:
+            raise TaskParserError("Неверный ключ LLM_API_KEY") from exc
+        except openai.NotFoundError as exc:
+            raise TaskParserError(f"Модель «{self._model}» не найдена — проверьте LLM_MODEL") from exc
+        except openai.RateLimitError as exc:
+            raise TaskParserError("Превышен лимит запросов или закончился баланс, попробуйте позже") from exc
+        except openai.APIConnectionError as exc:
+            raise TaskParserError(f"Нет связи с сервисом нейросети: {exc}") from exc
+        except openai.APIStatusError as exc:
+            raise TaskParserError(f"Ошибка сервиса нейросети {exc.status_code}: {exc.message}") from exc
+        return _extract_json(text)
 
     async def parse_tasks(self, text: str, today: date) -> list[TaskDraft]:
         """Возвращает список задач из сообщения (может быть пустым)."""
         user = f"{_context(today)}\n\nСообщение руководителя:\n<message>\n{text}\n</message>"
-        data = await self._ask(self._system_tasks, user, TASKS_SCHEMA)
+        data = await self._ask(self._system_tasks, user)
+
+        tasks = data.get("tasks")
+        if not isinstance(tasks, list):
+            raise TaskParserError("В ответе нейросети нет списка задач")
 
         drafts: list[TaskDraft] = []
-        for item in data.get("tasks") or []:
+        for item in tasks:
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title") or "").strip()
             if not title:
                 continue
             assignee = item.get("assignee")
-            assignee = assignee.strip() if isinstance(assignee, str) and assignee.strip() else None
+            if not isinstance(assignee, str) or assignee.strip().lower() in {"", "null", "none"}:
+                assignee = None
+            else:
+                assignee = assignee.strip()
             drafts.append(
                 TaskDraft(title=title, assignee=assignee, deadline=_parse_iso(item.get("deadline")))
             )
@@ -190,5 +187,5 @@ class TaskParser:
     async def parse_date(self, text: str, today: date) -> date | None:
         """Понимает срок на естественном языке («к концу месяца», «через две недели»)."""
         user = f"{_context(today)}\n\nСрок:\n<deadline>\n{text}\n</deadline>"
-        data = await self._ask(_SYSTEM_DATE, user, DATE_SCHEMA)
+        data = await self._ask(_SYSTEM_DATE, user)
         return _parse_iso(data.get("deadline"))

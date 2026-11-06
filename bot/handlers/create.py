@@ -79,7 +79,7 @@ async def _propose(
     try:
         drafts = await parser.parse_tasks(text, today)
     except TaskParserError as exc:
-        log.warning("Не удалось разобрать задачу через Claude: %s", exc)
+        log.warning("Не удалось разобрать задачу через нейросеть: %s", exc)
         drafts = [TaskDraft(title=text.strip())]
         note = (
             "⚠️ Автоматический разбор сейчас недоступен — сохраню текст как есть. "

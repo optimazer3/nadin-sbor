@@ -1,7 +1,7 @@
 [project]
 name = "nadin-sbor-bot"
 version = "0.1.0"
-description = "Telegram-бот руководителя для учёта задач команды (голос, Supabase, AssemblyAI, Claude)"
+description = "Telegram-бот руководителя для учёта задач команды (голос, Supabase, AssemblyAI, Polza AI)"
 requires-python = ">=3.11"
 
 [tool.ruff]
