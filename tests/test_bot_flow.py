@@ -26,6 +26,7 @@ from bot.handlers import get_routers
 from bot.keyboards import BTN_DASHBOARD, BTN_TASKS, DraftCb
 from bot.main import build_dispatcher
 from bot.models import Action, ActionType, Status, TaskDraft
+from bot.numbering import Numbering
 from bot.repository import InMemoryTaskRepository
 from bot.scheduler import ReminderService, send_weekly_reminder
 from bot.services.task_parser import TaskParserError
@@ -107,9 +108,11 @@ class FakeParser:
         self.contexts: list[list[int]] = []
         self.focus_ids: list[int | None] = []
         self.schedules: list[str | None] = []
+        self.numbers: list[dict[int, int]] = []
 
-    async def interpret(self, text: str, today: date, tasks=(), focus_id=None, schedule=None):
+    async def interpret(self, text: str, today: date, tasks=(), focus_id=None, schedule=None, numbers=None):
         self.texts.append(text)
+        self.numbers.append(dict(numbers or {}))
         self.schedules.append(schedule)
         self.contexts.append([t.id for t in tasks])
         self.focus_ids.append(focus_id)
@@ -156,9 +159,16 @@ def env(tmp_path):
     focus = FocusStore()
     reminder = ReminderService(settings, path=tmp_path / "schedule.json")
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
-    reminder.attach(scheduler, bot, repo)
+    numbering = Numbering()
+    reminder.attach(scheduler, bot, repo, numbering)
     dp = build_dispatcher(
-        settings, repo=repo, transcriber=transcriber, parser=parser, focus=focus, reminder=reminder
+        settings,
+        repo=repo,
+        transcriber=transcriber,
+        parser=parser,
+        focus=focus,
+        reminder=reminder,
+        numbering=numbering,
     )
 
     class Env:
@@ -175,6 +185,7 @@ def env(tmp_path):
         dp,
     )
     e.focus = focus
+    e.numbering = numbering
     e.reminder, e.scheduler, e.schedule_file = reminder, scheduler, tmp_path / "schedule.json"
     e._uid = count(1)
     e._mid = count(1)
@@ -261,12 +272,40 @@ async def test_task_list_is_plain_text_with_numbers(env):
     report, price = await _two_tasks(env)
     await env.send(BTN_TASKS)
     call = env.session.sent()[-1]
-    assert "Задачи в работе</b> — 2" in call.text
-    assert f"<b>№{price.id}</b>  Обновить прайс" in call.text  # раньше срок — выше в списке
-    assert call.text.index(f"№{price.id}") < call.text.index(f"№{report.id}")
-    assert "👤 Мария" in call.text
-    assert f"«задача {price.id} выполнена»" in call.text  # подсказка, как сказать
+    assert "Задачи в работе</b>\nВсего: 2 задачи" in call.text
+    assert "👤 <b>Иван</b> — 1 задача\n\n<b>1.</b> Подготовить отчёт" in call.text
+    assert "👤 <b>Мария</b> — 1 задача\n\n<b>2.</b> Обновить прайс" in call.text
+    assert "«задача 1 выполнена»" in call.text  # подсказка, как сказать
     assert inline_buttons(call) == []
+
+
+async def test_numbers_go_in_order_and_mean_what_was_shown(env):
+    # Задачи в базе с «рваными» номерами: 1, 2, 3 — но Мария по алфавиту позже Ивана.
+    maria = await _create(env, "Прайс", "Мария", date(2026, 11, 11))
+    ivan1 = await _create(env, "Отчёт", "Иван", date(2026, 11, 20))
+    ivan2 = await _create(env, "Звонок", "иван", date(2026, 11, 10))
+    await env.send(BTN_TASKS)
+    text = env.session.last_text()
+    assert "👤 <b>Иван</b> — 2 задачи" in text  # «Иван» и «иван» — один человек
+    assert text.index("<b>1.</b> Звонок") < text.index("<b>2.</b> Отчёт") < text.index("<b>3.</b> Прайс")
+
+    # Нейросеть видит задачи под теми же номерами, что и руководитель.
+    env.parser.actions = [Action(ActionType.DELETE, task_ids=[ivan2.id])]
+    await env.send("удали задачу 1")
+    assert env.parser.numbers[-1] == {ivan2.id: 1, ivan1.id: 2, maria.id: 3}
+    assert "🗑 <b>Удалить задачу</b> №1 «Звонок»" in env.session.last_text()
+    await env.send("да")
+    assert "🗑 Удалена №1 «Звонок»" in env.session.last_text()
+
+    # До следующего показа списка номера не «съезжают»: Отчёт так и остаётся №2.
+    env.parser.actions = [Action(ActionType.UPDATE, task_ids=[ivan1.id], status=Status.DONE)]
+    await env.send("задача 2 выполнена")
+    assert "№2 «Отчёт»" in env.session.last_text()
+    await env.send("нет")
+
+    # Новый показ списка — снова 1, 2…
+    await env.send(BTN_TASKS)
+    assert "<b>1.</b> Отчёт" in env.session.last_text()
 
 
 # ---------- создание ----------
@@ -463,7 +502,7 @@ async def test_show_commands_run_immediately(env):
     env.parser.actions = [Action(ActionType.SHOW_TASKS, assignee="Мария", filter="active")]
     await env.send("покажи задачи Марии")
     text = env.session.last_text()
-    assert "Задачи в работе</b> — Мария — 1" in text
+    assert "Задачи в работе</b> — Мария\nВсего: 1 задача" in text
     assert "Обновить прайс" in text and "Подготовить отчёт" not in text
 
     env.parser.actions = [Action(ActionType.SHOW_TASKS, filter="archive")]

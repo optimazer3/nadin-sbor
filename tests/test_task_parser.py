@@ -109,8 +109,17 @@ async def test_create_request_and_mapping(llm):
     assert "2026-11-06, пятница" in user["content"] and "2026-11-13 пятница" in user["content"]
     assert "Ване отчёт до пятницы" in user["content"]
     # Нейросеть видит текущие задачи и знает, какая карточка открыта.
-    assert "#5 | Подготовить отчёт | Иван | 2026-11-13 | in_progress" in user["content"]
-    assert "#7 | Обновить прайс | Мария | - | new  <- открыта сейчас" in user["content"]
+    assert "№5 | Подготовить отчёт | Иван | 2026-11-13 | in_progress" in user["content"]
+    assert "№7 | Обновить прайс | Мария | - | new  <- открыта сейчас" in user["content"]
+
+
+async def test_display_numbers_are_translated_to_ids(llm):
+    # Руководитель видел: 1 — прайс (id 7), 2 — отчёт (id 5), 3 — вода (id 9).
+    parser, fake = await llm(reply({"type": "update", "task_ids": [1, 2], "status": "done"}))
+    [action] = await parser.interpret("задачи 1 и 2 выполнены", TODAY, CONTEXT, numbers={7: 1, 5: 2, 9: 3})
+    assert action.task_ids == [7, 5]
+    user = fake.requests[0]["messages"][1]["content"]
+    assert user.index("№1 | Обновить прайс") < user.index("№2 | Подготовить отчёт") < user.index("№3 |")
 
 
 async def test_update_delete_and_views(llm):

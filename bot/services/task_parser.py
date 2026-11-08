@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 from typing import Any
 
@@ -132,14 +132,16 @@ _MAX_IDS = 30
 _NULL_STRINGS = {"", "null", "none", "нет"}
 
 
-def _tasks_block(tasks: Sequence[Task], focus_id: int | None) -> str:
+def _tasks_block(tasks: Sequence[Task], focus_id: int | None, numbers: Mapping[int, int]) -> str:
     if not tasks:
         return "Текущих задач нет."
     lines = ["Текущие задачи (номер | формулировка | исполнитель | срок | статус):"]
     for t in tasks:
         mark = "  <- открыта сейчас" if t.id == focus_id else ""
         deadline = t.deadline.isoformat() if t.deadline else "-"
-        lines.append(f"#{t.id} | {t.title} | {t.assignee or '-'} | {deadline} | {t.status.value}{mark}")
+        lines.append(
+            f"№{numbers.get(t.id, t.id)} | {t.title} | {t.assignee or '-'} | {deadline} | {t.status.value}{mark}"
+        )
     return "\n".join(lines)
 
 
@@ -172,7 +174,7 @@ def _ids(value: Any) -> list[int]:
     return result
 
 
-def _to_actions(items: list[Any], known_ids: set[int]) -> list[Action]:
+def _to_actions(items: list[Any], by_number: Mapping[int, int]) -> list[Action]:
     """Проверяет ответ нейросети: выкидывает мусор и несуществующие номера задач."""
     actions: list[Action] = []
     for item in items:
@@ -182,7 +184,8 @@ def _to_actions(items: list[Any], known_ids: set[int]) -> list[Action]:
             kind = ActionType(str(item.get("type") or "").strip().lower())
         except ValueError:
             continue
-        ids = [i for i in _ids(item.get("task_ids")) if i in known_ids][:_MAX_IDS]
+        # Нейросеть называет задачи номерами из списка — переводим их в номера в базе.
+        ids = [by_number[n] for n in _ids(item.get("task_ids")) if n in by_number][:_MAX_IDS]
         status_raw = _clean(item.get("status"))
         status = Status(status_raw) if status_raw in {s.value for s in Status} else None
         filter_raw = _clean(item.get("filter"))
@@ -304,13 +307,17 @@ class TaskParser:
         tasks: Sequence[Task] = (),
         focus_id: int | None = None,
         schedule: str | None = None,
+        numbers: Mapping[int, int] | None = None,
     ) -> list[Action]:
         """Понимает, что хочет руководитель: создать, изменить, удалить, показать задачи.
 
         tasks — текущие задачи (чтобы найти, о какой речь), focus_id — открытая сейчас карточка.
         """
+        # numbers: номер в базе -> номер, который руководитель видел в списке (1, 2, 3…).
+        numbers = {t.id: (numbers or {}).get(t.id, t.id) for t in tasks}
+        tasks = sorted(tasks, key=lambda t: numbers[t.id])
         user = (
-            f"{_context(today)}\n\n{_tasks_block(tasks, focus_id)}\n\n"
+            f"{_context(today)}\n\n{_tasks_block(tasks, focus_id, numbers)}\n\n"
             f"Еженедельная сводка сейчас приходит: {schedule or 'не настроено'}.\n\n"
             f"Сообщение руководителя:\n<message>\n{text}\n</message>"
         )
@@ -318,4 +325,4 @@ class TaskParser:
         actions = data.get("actions")
         if not isinstance(actions, list):
             raise TaskParserError("В ответе нейросети нет списка действий")
-        return _to_actions(actions, known_ids={t.id for t in tasks})
+        return _to_actions(actions, by_number={numbers[t.id]: t.id for t in tasks})

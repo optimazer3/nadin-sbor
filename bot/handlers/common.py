@@ -9,6 +9,7 @@ from aiogram.types import Message
 
 from bot.config import Settings
 from bot.keyboards import BTN_DASHBOARD, main_menu
+from bot.numbering import Numbering
 from bot.repository import TaskRepository
 from bot.scheduler import ReminderService, send_dashboard
 from bot.views import HELP_COMMANDS
@@ -51,6 +52,7 @@ async def btn_dashboard(
     repo: TaskRepository,
     settings: Settings,
     reminder: ReminderService,
+    numbering: Numbering,
 ) -> None:
     await state.clear()
-    await send_dashboard(bot, message.chat.id, repo, settings, reminder)
+    await send_dashboard(bot, message.chat.id, repo, settings, reminder, numbering=numbering)

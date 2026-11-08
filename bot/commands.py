@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import time
 from html import escape
@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from bot.models import Action, ActionType, Task
 from bot.repository import TaskRepository
+from bot.team import match_team
 
 if TYPE_CHECKING:
     from bot.scheduler import ReminderService
@@ -38,16 +39,6 @@ class ApplyResult:
     @property
     def nothing_done(self) -> bool:
         return not (self.created or self.updated or self.deleted or self.schedule_changed)
-
-
-def match_team(name: str | None, team: Sequence[str]) -> str | None:
-    """Приводит имя к написанию из TEAM_MEMBERS («иван» → «Иван»)."""
-    if not name:
-        return name
-    for member in team:
-        if member.lower() == name.strip().lower():
-            return member
-    return name.strip()
 
 
 def normalize_team(actions: Sequence[Action], team: Sequence[str]) -> list[Action]:
@@ -81,6 +72,7 @@ async def apply_plan(
     raw_text: str | None,
     created_by: int | None,
     reminder: ReminderService | None = None,
+    number: Callable[[int], int] = lambda task_id: task_id,
 ) -> ApplyResult:
     """Выполняет действия по порядку. Ошибка в одном действии не мешает остальным."""
     result = ApplyResult()
@@ -95,7 +87,7 @@ async def apply_plan(
             result.lines.append("⚠️ Не удалось создать новые задачи — ошибка базы данных")
         else:
             result.created.extend(created)
-            result.lines.extend(f"➕ Создана №{t.id} «{escape(t.title)}»" for t in created)
+            result.lines.extend(f"➕ Создана №{number(t.id)} «{escape(t.title)}»" for t in created)
 
     for action in actions:
         if action.type == ActionType.SET_SCHEDULE and reminder is not None:
@@ -117,20 +109,24 @@ async def apply_plan(
                 if action.type == ActionType.UPDATE:
                     task = await repo.update(task_id, **action.changes())
                     if task is None:
-                        result.lines.append(f"⚠️ Задача №{task_id} не найдена — возможно, её уже удалили")
+                        result.lines.append(
+                            f"⚠️ Задача №{number(task_id)} не найдена — возможно, её уже удалили"
+                        )
                         continue
                     result.updated.append(task)
                     summary = _change_summary(action, task)
-                    result.lines.append(f"✏️ №{task.id} «{escape(task.title)}»: {summary}")
+                    result.lines.append(f"✏️ №{number(task.id)} «{escape(task.title)}»: {summary}")
                 else:
                     task = await repo.get(task_id)
                     if task is None or not await repo.delete(task_id):
-                        result.lines.append(f"⚠️ Задача №{task_id} не найдена — возможно, её уже удалили")
+                        result.lines.append(
+                            f"⚠️ Задача №{number(task_id)} не найдена — возможно, её уже удалили"
+                        )
                         continue
                     result.deleted.append(task_id)
-                    result.lines.append(f"🗑 Удалена №{task_id} «{escape(task.title)}»")
+                    result.lines.append(f"🗑 Удалена №{number(task_id)} «{escape(task.title)}»")
             except Exception:
                 log.exception("Не удалось выполнить %s для задачи %s", action.type, task_id)
                 result.errors += 1
-                result.lines.append(f"⚠️ Задача №{task_id}: ошибка базы данных, попробуйте ещё раз")
+                result.lines.append(f"⚠️ Задача №{number(task_id)}: ошибка базы данных, попробуйте ещё раз")
     return result

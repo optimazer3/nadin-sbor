@@ -10,6 +10,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, time
+from functools import partial
 from pathlib import Path
 
 from aiogram import Bot
@@ -18,9 +19,10 @@ from apscheduler.triggers.cron import CronTrigger
 
 from bot.config import WEEKDAYS, Settings
 from bot.dates import WEEKDAY_EVERY
+from bot.numbering import Numbering
 from bot.repository import TaskRepository
 from bot.utils import today_in
-from bot.views import dashboard
+from bot.views import dashboard, order_tasks
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +30,7 @@ JOB_ID = "weekly_dashboard"
 DASHBOARD_TITLE = "📊 <b>Сводка по задачам</b>"
 WEEKLY_TITLE = "🔔 <b>Еженедельная сводка по задачам</b>"
 DEFAULT_SCHEDULE_FILE = Path("data") / "schedule.json"
+ARCHIVE_LIMIT = 30  # как в списке задач: те же задачи — те же номера
 
 
 @dataclass(frozen=True)
@@ -71,12 +74,20 @@ class ReminderService:
             timezone=self._settings.timezone,
         )
 
-    def attach(self, scheduler: AsyncIOScheduler, bot: Bot, repo: TaskRepository) -> None:
+    def attach(
+        self, scheduler: AsyncIOScheduler, bot: Bot, repo: TaskRepository, numbering: Numbering | None = None
+    ) -> None:
         self._scheduler = scheduler
         scheduler.add_job(
             send_weekly_reminder,
             trigger=self._trigger(),
-            kwargs={"bot": bot, "repo": repo, "settings": self._settings, "reminder": self},
+            kwargs={
+                "bot": bot,
+                "repo": repo,
+                "settings": self._settings,
+                "reminder": self,
+                "numbering": numbering,
+            },
             id=JOB_ID,
             replace_existing=True,
             # Если компьютер «проснулся» позже (но в течение 6 часов) — всё равно отправим.
@@ -113,9 +124,18 @@ async def dashboard_messages(
     settings: Settings,
     reminder: ReminderService | None = None,
     title: str = DASHBOARD_TITLE,
+    numbering: Numbering | None = None,
+    chat_id: int | None = None,
 ) -> list[str]:
     tasks = await repo.list_active()
-    chunks = dashboard(tasks, today_in(settings.timezone), title=title)
+    team = settings.team_members
+    number = None
+    if numbering is not None and chat_id is not None:
+        # Номера в сводке — те же, что в списке «Задачи»: по ним можно сразу командовать голосом.
+        archived = await repo.list_recent_archived(ARCHIVE_LIMIT)
+        numbering.reset(chat_id, [t.id for t in order_tasks([*tasks, *archived], team)])
+        number = partial(numbering.number, chat_id)
+    chunks = dashboard(tasks, today_in(settings.timezone), title, number or (lambda task_id: task_id), team)
     if reminder:
         chunks[-1] += "\n\n" + reminder.hint()
     return chunks
@@ -128,25 +148,34 @@ async def send_dashboard(
     settings: Settings,
     reminder: ReminderService | None = None,
     title: str = DASHBOARD_TITLE,
+    numbering: Numbering | None = None,
 ) -> None:
-    for text in await dashboard_messages(repo, settings, reminder, title):
+    for text in await dashboard_messages(repo, settings, reminder, title, numbering, chat_id):
         await bot.send_message(chat_id, text)
 
 
 async def send_weekly_reminder(
-    bot: Bot, repo: TaskRepository, settings: Settings, reminder: ReminderService | None = None
+    bot: Bot,
+    repo: TaskRepository,
+    settings: Settings,
+    reminder: ReminderService | None = None,
+    numbering: Numbering | None = None,
 ) -> None:
     log.info("Отправляю еженедельную сводку: %s", sorted(settings.admin_ids))
     for admin_id in settings.admin_ids:
         try:
-            await send_dashboard(bot, admin_id, repo, settings, reminder, title=WEEKLY_TITLE)
+            await send_dashboard(bot, admin_id, repo, settings, reminder, WEEKLY_TITLE, numbering)
         except Exception:  # одному не дошло — остальным всё равно отправляем
             log.exception("Не удалось отправить сводку пользователю %s", admin_id)
 
 
 def setup_scheduler(
-    bot: Bot, repo: TaskRepository, settings: Settings, reminder: ReminderService | None = None
+    bot: Bot,
+    repo: TaskRepository,
+    settings: Settings,
+    reminder: ReminderService | None = None,
+    numbering: Numbering | None = None,
 ) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
-    (reminder or ReminderService(settings, path=None)).attach(scheduler, bot, repo)
+    (reminder or ReminderService(settings, path=None)).attach(scheduler, bot, repo, numbering)
     return scheduler

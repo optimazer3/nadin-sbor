@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from functools import partial
 from html import escape
 
 from aiogram import Bot, F, Router
@@ -21,9 +22,10 @@ from aiogram.types import CallbackQuery, Message
 from bot.commands import apply_plan, normalize_team
 from bot.config import Settings
 from bot.focus import FocusStore
-from bot.handlers.tasks import card_text, list_messages
+from bot.handlers.tasks import card_text, list_messages, load_tasks, renumber
 from bot.keyboards import DraftCb, draft_keyboard, main_menu
 from bot.models import Action, ActionType, Task, TaskDraft
+from bot.numbering import Numbering
 from bot.repository import TaskRepository
 from bot.scheduler import ReminderService, dashboard_messages
 from bot.services.task_parser import TaskParser, TaskParserError
@@ -33,9 +35,6 @@ from bot.views import HELP_COMMANDS, apply_result_text, plan_text
 
 log = logging.getLogger(__name__)
 router = Router(name="create")
-
-# Сколько недавно закрытых задач показывать нейросети, чтобы работало «верни задачу в работу».
-RECENT_ARCHIVED = 20
 
 # Короткие ответы на «Я правильно понял?». Сравниваются целиком, поэтому
 # «нет, перенеси на среду» — это уже новая команда, а не просто «нет».
@@ -74,6 +73,7 @@ async def on_voice(
     settings: Settings,
     focus: FocusStore,
     reminder: ReminderService,
+    numbering: Numbering,
 ) -> None:
     status = await message.answer("🎧 Слушаю…")
     try:
@@ -85,7 +85,9 @@ async def on_voice(
         )
         return
     await status.edit_text(f"🎧 Вы сказали: <i>«{escape(text)}»</i>\n\n🤔 Думаю…")
-    await _handle(status, state, bot, parser, repo, settings, focus, reminder, text=text, source="voice")
+    await _handle(
+        status, state, bot, parser, repo, settings, focus, reminder, numbering, text=text, source="voice"
+    )
 
 
 @router.message(_INPUT, F.text, ~F.text.startswith("/"))
@@ -98,22 +100,31 @@ async def on_text(
     settings: Settings,
     focus: FocusStore,
     reminder: ReminderService,
+    numbering: Numbering,
 ) -> None:
     status = await message.answer("🤔 Думаю…")
     await _handle(
-        status, state, bot, parser, repo, settings, focus, reminder, text=message.text or "", source="text"
+        status,
+        state,
+        bot,
+        parser,
+        repo,
+        settings,
+        focus,
+        reminder,
+        numbering,
+        text=message.text or "",
+        source="text",
     )
 
 
 async def _context_tasks(repo: TaskRepository) -> list[Task]:
     """Задачи, среди которых нейросеть ищет ту, о которой речь."""
     try:
-        active = await repo.list_active()
-        archived = await repo.list_recent_archived(RECENT_ARCHIVED)
+        return await load_tasks(repo)
     except Exception:
         log.exception("Не удалось загрузить задачи для разбора команды")
         return []
-    return [*active, *archived]
 
 
 async def _handle(
@@ -125,12 +136,14 @@ async def _handle(
     settings: Settings,
     focus: FocusStore,
     reminder: ReminderService,
+    numbering: Numbering,
     *,
     text: str,
     source: str,
 ) -> None:
     today = today_in(settings.timezone)
     chat_id = status.chat.id
+    number = partial(numbering.number, chat_id)
     recognized = text if source == "voice" else None
     heard = f"🎧 Вы сказали: <i>«{escape(text)}»</i>\n\n" if recognized else ""
 
@@ -142,7 +155,9 @@ async def _handle(
             await state.clear()
             await drop_keyboard(bot, chat_id, data.get("draft_msg_id"))
             if answer in YES:
-                ok = await _execute(status, state, data, repo, focus, reminder, user_id=chat_id, prefix=heard)
+                ok = await _execute(
+                    status, state, data, repo, focus, reminder, numbering, user_id=chat_id, prefix=heard
+                )
                 if not ok:
                     await safe_edit(status, heard + "⚠️ Не получилось сохранить. Скажите «да» ещё раз.")
             else:
@@ -151,10 +166,17 @@ async def _handle(
 
     context = await _context_tasks(repo)
     tasks_by_id = {t.id: t for t in context}
+    if not numbering.has(chat_id):  # список ещё не показывали (например, после перезапуска)
+        renumber(numbering, chat_id, context, settings)
     note = ""
     try:
         actions = await parser.interpret(
-            text, today, context, focus.get(chat_id), schedule=reminder.schedule.describe()
+            text,
+            today,
+            context,
+            focus.get(chat_id),
+            schedule=reminder.schedule.describe(),
+            numbers=numbering.numbers(chat_id, tasks_by_id),
         )
     except TaskParserError as exc:
         log.warning("Не удалось разобрать сообщение через нейросеть: %s", exc)
@@ -172,7 +194,9 @@ async def _handle(
     views: list[str] = []
     for action in actions:
         if not action.is_mutating:
-            views.extend(await _render(action, repo, settings, focus, reminder, chat_id, tasks_by_id, heard))
+            views.extend(
+                await _render(action, repo, settings, focus, reminder, numbering, chat_id, tasks_by_id, heard)
+            )
 
     if mutations:
         # Старый неподтверждённый план (если был) заменяется новым — убираем его кнопки.
@@ -188,7 +212,9 @@ async def _handle(
                 "draft_msg_id": status.message_id,
             }
         )
-        await safe_edit(status, note + plan_text(mutations, tasks_by_id, today, recognized), draft_keyboard())
+        await safe_edit(
+            status, note + plan_text(mutations, tasks_by_id, today, recognized, number), draft_keyboard()
+        )
         for view in views:
             await status.answer(view)
         return
@@ -205,23 +231,26 @@ async def _render(
     settings: Settings,
     focus: FocusStore,
     reminder: ReminderService,
+    numbering: Numbering,
     chat_id: int,
     tasks_by_id: dict[int, Task],
     heard: str,
 ) -> list[str]:
     """Ответ на команды «показать»: список, сводка, задача, уточняющий вопрос."""
     if action.type == ActionType.SHOW_DASHBOARD:
-        return await dashboard_messages(repo, settings, reminder)
+        return await dashboard_messages(repo, settings, reminder, numbering=numbering, chat_id=chat_id)
 
     if action.type == ActionType.SHOW_TASKS:
-        return await list_messages(repo, settings, action.filter or "active", action.assignee)
+        return await list_messages(
+            repo, settings, numbering, chat_id, action.filter or "active", action.assignee
+        )
 
     if action.type == ActionType.OPEN_TASK:
         task = await repo.get(action.task_ids[0])
         if task is None:
-            return [f"Задачи №{action.task_ids[0]} нет — возможно, её удалили."]
+            return [f"Задачи №{numbering.number(chat_id, action.task_ids[0])} нет — возможно, её удалили."]
         focus.set(chat_id, task.id)
-        return [card_text(task, settings)]
+        return [card_text(task, settings, numbering.number(chat_id, task.id))]
 
     # unclear: переспрашиваем и перечисляем подходящие задачи
     question = action.question or "Не понял, о какой задаче речь."
@@ -230,10 +259,12 @@ async def _render(
     if candidates:
         lines.append("")
         lines += [
-            f"<b>№{t.id}</b>  {escape(t.title)}" + (f" — {escape(t.assignee)}" if t.assignee else "")
+            f"<b>№{numbering.number(chat_id, t.id)}</b>  {escape(t.title)}"
+            + (f" — {escape(t.assignee)}" if t.assignee else "")
             for t in candidates
         ]
-        lines.append(f"\nСкажите с номером, например: <i>«задача {candidates[0].id} выполнена»</i>.")
+        first = numbering.number(chat_id, candidates[0].id)
+        lines.append(f"\nСкажите с номером, например: <i>«задача {first} выполнена»</i>.")
     else:
         lines.append("\nСкажите с номером задачи. Номера видно по кнопке «📋 Задачи».")
     return ["\n".join(lines)]
@@ -253,6 +284,7 @@ async def _execute(
     repo: TaskRepository,
     focus: FocusStore,
     reminder: ReminderService,
+    numbering: Numbering,
     *,
     user_id: int,
     prefix: str = "",
@@ -266,6 +298,7 @@ async def _execute(
         raw_text=data.get("raw_text"),
         created_by=user_id,
         reminder=reminder,
+        number=partial(numbering.number, message.chat.id),
     )
     if result.nothing_done and result.errors:
         await state.set_state(CreateTask.confirm)  # ничего не применилось — можно подтвердить ещё раз
@@ -278,7 +311,11 @@ async def _execute(
     if len(result.touched) == 1:
         focus.set(chat_id, result.touched[0].id)
     only_creates = all(a.type == ActionType.CREATE for a in plan)
-    await safe_edit(message, prefix + apply_result_text(result.lines, result.created, only_creates))
+    await safe_edit(
+        message,
+        prefix
+        + apply_result_text(result.lines, result.created, only_creates, partial(numbering.number, chat_id)),
+    )
     return True
 
 
@@ -305,6 +342,7 @@ async def on_save(
     repo: TaskRepository,
     focus: FocusStore,
     reminder: ReminderService,
+    numbering: Numbering,
 ) -> None:
     data = await _take_plan(callback, state)
     if data is None:
@@ -312,7 +350,9 @@ async def on_save(
         if callback.message:
             await drop_keyboard(bot, callback.message.chat.id, callback.message.message_id)
         return
-    if await _execute(callback.message, state, data, repo, focus, reminder, user_id=callback.from_user.id):
+    if await _execute(
+        callback.message, state, data, repo, focus, reminder, numbering, user_id=callback.from_user.id
+    ):
         await callback.answer("Готово")
     else:
         await callback.answer("Не получилось сохранить. Нажмите «Да» ещё раз.", show_alert=True)

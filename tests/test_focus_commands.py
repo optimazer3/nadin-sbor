@@ -1,9 +1,10 @@
 from datetime import date
 
-from bot.commands import apply_plan, match_team
+from bot.commands import apply_plan
 from bot.focus import FocusStore
 from bot.models import Action, ActionType, Status, TaskDraft
 from bot.repository import InMemoryTaskRepository
+from bot.team import match_team, person_key
 
 
 def test_focus_expires_and_drops():
@@ -25,6 +26,13 @@ def test_match_team():
     assert match_team(" иван ", team) == "Иван"
     assert match_team("Пётр", team) == "Пётр"
     assert match_team(None, team) is None
+    full = ("Иван Петров", "Иван Сидоров", "Мария Кузнецова")
+    assert match_team("Мария", full) == "Мария Кузнецова"  # по имени — если такая одна
+    assert match_team("петров", full) == "Иван Петров"  # по фамилии
+    assert match_team("Иван", full) == "Иван"  # Иванов двое — не угадываем
+    assert match_team("Пётр  Иванов", full) == "Пётр Иванов"
+    assert person_key("иван петров", full) == person_key("Петров", full) == "иван петров"
+    assert person_key(None, full) == ""
 
 
 class FlakyRepo(InMemoryTaskRepository):

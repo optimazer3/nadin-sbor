@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from html import escape
 
 from bot.dates import WEEKDAY_EVERY, WEEKDAY_SHORT, format_date, format_date_short, relative_deadline
 from bot.models import ACTIVE_STATUSES, Action, ActionType, Status, Task, TaskDraft
+from bot.team import match_team, person_key
 
 TELEGRAM_LIMIT = 4000  # реальный предел 4096, оставляем запас
 
@@ -36,79 +37,126 @@ def draft_text(drafts: Sequence[TaskDraft], today: date, recognized: str | None)
         parts.append(
             f"{prefix}📝 {escape(d.title)}\n"
             f"👤 Исполнитель: {escape(d.assignee) if d.assignee else 'не указан'}\n"
-            f"📅 Дедлайн: {_deadline_text(d.deadline, today)}\n"
+            f"📅 Срок: {_deadline_text(d.deadline, today)}\n"
         )
     return "\n".join(parts).rstrip()
 
 
-def task_card(task: Task, today: date) -> str:
+Num = Callable[[int], int]  # номер задачи из базы -> номер, который видит руководитель
+
+
+def _same(task_id: int) -> int:
+    return task_id
+
+
+def task_card(task: Task, today: date, number: Num = _same) -> str:
     lines = [
-        f"<b>Задача №{task.id}</b>",
+        f"<b>Задача №{number(task.id)}</b>",
         "",
         f"📝 {escape(task.title)}",
         f"👤 Исполнитель: {escape(task.assignee) if task.assignee else 'не указан'}",
-        f"📅 Дедлайн: {_deadline_text(task.deadline, today)}",
+        f"📅 Срок: {_deadline_text(task.deadline, today)}",
         f"📌 Статус: {task.status.display}",
     ]
     if task.created_at:
         lines.append(f"🕓 Создана: {task.created_at:%d.%m.%Y}")
-    if task.source == "voice":
-        lines.append("🎙 Создана голосом")
     return "\n".join(lines)
 
 
 def _deadline_marker(deadline: date | None, today: date, active: bool) -> str:
     if deadline is None:
         return ""
-    text = f"до {format_date_short(deadline, today)}"
+    text = f"до {WEEKDAY_SHORT[deadline.weekday()]}, {format_date_short(deadline, today)}"
     if active:
         delta = (deadline - today).days
         if delta < 0:
-            text += f" ❗ {relative_deadline(deadline, today)}"
+            text += f"  ❗ {relative_deadline(deadline, today)}"
         elif delta == 0:
-            text += " ⏰ сегодня"
+            text += "  ⏰ сегодня"
         elif delta == 1:
-            text += " ⏰ завтра"
+            text += "  ⏰ завтра"
     return text
-
-
-LIST_HINT = (
-    "Чтобы изменить задачу, назовите её номер, например:\n"
-    "<i>«задача {n} выполнена»</i>, <i>«перенеси задачу {n} на пятницу»</i>, <i>«удали задачу {n}»</i>."
-)
-
-
-def _list_item(task: Task, today: date) -> str:
-    details = [f"👤 {escape(task.assignee)}" if task.assignee else "👤 исполнитель не указан"]
-    if task.deadline:
-        details.append(f"📅 {_deadline_marker(task.deadline, today, task.is_active)}")
-    details.append(task.status.display)
-    return f"<b>№{task.id}</b>  {escape(task.title)}\n      " + " · ".join(details)
-
-
-def task_list_messages(tasks: Sequence[Task], today: date, title: str) -> list[str]:
-    """Список задач простым текстом — без кнопок, с номерами для голосовых команд."""
-    if not tasks:
-        return [f"{title}\n\nЗадач нет."]
-    items = sorted(tasks, key=_sort_key)
-    blocks = [f"{title} — {len(items)}"]
-    blocks += [_list_item(t, today) for t in items]
-    blocks.append(LIST_HINT.format(n=items[0].id))
-    return split_message(blocks)
-
-
-def _dashboard_line(task: Task, today: date) -> str:
-    marker = _deadline_marker(task.deadline, today, active=True)
-    tail = f" · {marker}" if marker else ""
-    return f"{task.status.emoji} №{task.id} {escape(task.title)}{tail}"
 
 
 def _sort_key(task: Task) -> tuple:
     return (task.deadline is None, task.deadline or date.max, task.id)
 
 
-def dashboard(tasks: Sequence[Task], today: date, title: str = "📊 <b>Сводка по задачам</b>") -> list[str]:
-    """Сводка активных задач. Возвращает список сообщений (длинный дашборд режется на части)."""
+def group_by_person(tasks: Sequence[Task], team: Sequence[str] = ()) -> list[tuple[str, list[Task]]]:
+    """Задачи по исполнителям: одно ФИО — одна группа. Внутри — по сроку, «Без исполнителя» в конце."""
+    groups: dict[str, tuple[str, list[Task]]] = {}
+    for task in tasks:
+        key = person_key(task.assignee, team)
+        name = (match_team(task.assignee, team) or NO_ASSIGNEE) if key else NO_ASSIGNEE
+        groups.setdefault(key, (name, []))[1].append(task)
+    ordered = sorted(groups.items(), key=lambda item: (item[0] == "", item[1][0].lower()))
+    return [(name, sorted(items, key=_sort_key)) for _, (name, items) in ordered]
+
+
+def order_tasks(tasks: Sequence[Task], team: Sequence[str] = ()) -> list[Task]:
+    """Порядок для нумерации: сначала активные по людям, потом выполненные/отменённые по людям."""
+    active = [t for t in tasks if t.is_active]
+    closed = [t for t in tasks if not t.is_active]
+    return [t for part in (active, closed) for _, items in group_by_person(part, team) for t in items]
+
+
+def _tasks_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "задача"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "задачи"
+    return "задач"
+
+
+SEPARATOR = "➖➖➖➖➖➖➖➖"
+
+LIST_HINT = (
+    "💬 Чтобы изменить задачу, назовите её номер, например:\n"
+    "<i>«задача {n} выполнена»</i>, <i>«перенеси задачу {n} на пятницу»</i>, <i>«удали задачу {n}»</i>."
+)
+
+
+def _list_item(task: Task, today: date, number: Num) -> str:
+    details = []
+    if task.deadline:
+        details.append(f"📅 {_deadline_marker(task.deadline, today, task.is_active)}")
+    else:
+        details.append("📅 без срока")
+    details.append(task.status.display)
+    return f"<b>{number(task.id)}.</b> {escape(task.title)}\n      " + "  ·  ".join(details)
+
+
+def task_list_messages(
+    tasks: Sequence[Task], today: date, title: str, number: Num = _same, team: Sequence[str] = ()
+) -> list[str]:
+    """Список задач простым текстом: по исполнителям, номера по порядку, без кнопок."""
+    if not tasks:
+        return [f"{title}\n\nЗадач нет."]
+    groups = group_by_person(tasks, team)
+    blocks = [f"{title}\nВсего: {len(tasks)} {_tasks_word(len(tasks))}"]
+    for name, items in groups:
+        icon = "🙋" if name == NO_ASSIGNEE else "👤"
+        head = f"{SEPARATOR}\n{icon} <b>{escape(name)}</b> — {len(items)} {_tasks_word(len(items))}"
+        blocks.append(head + "\n\n" + "\n\n".join(_list_item(t, today, number) for t in items))
+    first = min(number(t.id) for t in tasks)
+    blocks.append(f"{SEPARATOR}\n" + LIST_HINT.format(n=first))
+    return split_message(blocks)
+
+
+def _dashboard_line(task: Task, today: date, number: Num) -> str:
+    marker = _deadline_marker(task.deadline, today, active=True)
+    tail = f"  ·  {marker}" if marker else ""
+    return f"{task.status.emoji} <b>{number(task.id)}.</b> {escape(task.title)}{tail}"
+
+
+def dashboard(
+    tasks: Sequence[Task],
+    today: date,
+    title: str = "📊 <b>Сводка по задачам</b>",
+    number: Num = _same,
+    team: Sequence[str] = (),
+) -> list[str]:
+    """Сводка активных задач. Возвращает список сообщений (длинная сводка режется на части)."""
     active = [t for t in tasks if t.status in ACTIVE_STATUSES]
     header = f"{title} — {WEEKDAY_SHORT[today.weekday()]}, {today:%d.%m.%Y}"
 
@@ -139,18 +187,10 @@ def dashboard(tasks: Sequence[Task], today: date, title: str = "📊 <b>Свод
     if flags:
         summary.append(" · ".join(flags))
 
-    groups: dict[str, list[Task]] = {}
-    for task in active:
-        groups.setdefault(task.assignee or NO_ASSIGNEE, []).append(task)
-
-    def group_order(name: str) -> tuple:
-        return (name == NO_ASSIGNEE, name.lower())
-
     blocks: list[str] = ["\n".join(summary)]
-    for name in sorted(groups, key=group_order):
-        items = sorted(groups[name], key=_sort_key)
-        lines = [f"👤 <b>{escape(name)}</b> ({len(items)})"]
-        lines += [_dashboard_line(t, today) for t in items]
+    for name, items in group_by_person(active, team):
+        lines = [SEPARATOR, f"👤 <b>{escape(name)}</b> — {len(items)} {_tasks_word(len(items))}"]
+        lines += [_dashboard_line(t, today, number) for t in items]
         blocks.append("\n".join(lines))
 
     return split_message(blocks)
@@ -201,9 +241,10 @@ def _short_deadline(deadline: date | None) -> str:
     return format_date(deadline) if deadline else "не указан"
 
 
-def _task_ref(task_id: int, tasks_by_id: Mapping[int, Task]) -> str:
+def _task_ref(task_id: int, tasks_by_id: Mapping[int, Task], number: Num) -> str:
     task = tasks_by_id.get(task_id)
-    return f"№{task_id} «{escape(task.title)}»" if task else f"№{task_id}"
+    n = number(task_id)
+    return f"№{n} «{escape(task.title)}»" if task else f"№{n}"
 
 
 def _change_lines(action: Action, task: Task | None) -> list[str]:
@@ -226,7 +267,11 @@ def _change_lines(action: Action, task: Task | None) -> list[str]:
 
 
 def plan_text(
-    actions: Sequence[Action], tasks_by_id: Mapping[int, Task], today: date, recognized: str | None
+    actions: Sequence[Action],
+    tasks_by_id: Mapping[int, Task],
+    today: date,
+    recognized: str | None,
+    number: Num = _same,
 ) -> str:
     """Что бот собирается сделать — показывается с кнопками «Да, сохранить» / «Нет»."""
     if all(a.type == ActionType.CREATE for a in actions):
@@ -243,28 +288,30 @@ def plan_text(
                 "➕ <b>Новая задача</b>\n"
                 f"📝 {escape(action.title or '')}\n"
                 f"👤 Исполнитель: {escape(action.assignee) if action.assignee else 'не указан'}\n"
-                f"📅 Дедлайн: {_deadline_text(action.deadline, today)}"
+                f"📅 Срок: {_deadline_text(action.deadline, today)}"
             )
         elif action.type == ActionType.UPDATE:
             for task_id in action.task_ids:
-                head = f"✏️ <b>Изменить задачу</b> {_task_ref(task_id, tasks_by_id)}"
+                head = f"✏️ <b>Изменить задачу</b> {_task_ref(task_id, tasks_by_id, number)}"
                 items.append("\n".join([head, *_change_lines(action, tasks_by_id.get(task_id))]))
         elif action.type == ActionType.SET_SCHEDULE:
             when = WEEKDAY_EVERY.get(action.weekday or "", action.weekday or "")
             items.append(f"⏰ <b>Присылать сводку</b> {when} в {action.time}")
         elif action.type == ActionType.DELETE:
             for task_id in action.task_ids:
-                items.append(f"🗑 <b>Удалить задачу</b> {_task_ref(task_id, tasks_by_id)}")
+                items.append(f"🗑 <b>Удалить задачу</b> {_task_ref(task_id, tasks_by_id, number)}")
     numbered = len(items) > 1
     for i, item in enumerate(items, 1):
         parts.append(f"<b>{i}.</b> {item}\n" if numbered else f"{item}\n")
     return "\n".join(parts).rstrip() + ANSWER_HINT
 
 
-def apply_result_text(lines: Sequence[str], created: Sequence[Task], only_creates: bool) -> str:
+def apply_result_text(
+    lines: Sequence[str], created: Sequence[Task], only_creates: bool, number: Num = _same
+) -> str:
     if only_creates and created and len(lines) == len(created):
         head = "✅ Задача сохранена" if len(created) == 1 else f"✅ Сохранено задач: {len(created)}"
-        return head + "\n\n" + "\n".join(f"№{t.id} {escape(t.title)}" for t in created)
+        return head + "\n\n" + "\n".join(f"№{number(t.id)} {escape(t.title)}" for t in created)
     return "✅ Готово\n\n" + "\n".join(lines)
 
 

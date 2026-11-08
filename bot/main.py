@@ -23,6 +23,7 @@ from bot.config import ConfigError, Settings, load_settings
 from bot.focus import FocusStore
 from bot.handlers import get_routers
 from bot.middlewares import AdminOnlyMiddleware
+from bot.numbering import Numbering
 from bot.repository import SupabaseTaskRepository
 from bot.scheduler import ReminderService, setup_scheduler
 from bot.services.task_parser import TaskParser
@@ -170,11 +171,18 @@ async def main() -> None:
         log.info("Нейросеть: модель %s через %s", settings.llm_model, settings.llm_base_url)
 
         reminder = ReminderService(settings)
+        numbering = Numbering()
         dp = build_dispatcher(
-            settings, repo=repo, transcriber=transcriber, parser=parser, focus=FocusStore(), reminder=reminder
+            settings,
+            repo=repo,
+            transcriber=transcriber,
+            parser=parser,
+            focus=FocusStore(),
+            reminder=reminder,
+            numbering=numbering,
         )
 
-        scheduler = setup_scheduler(bot, repo, settings, reminder)
+        scheduler = setup_scheduler(bot, repo, settings, reminder, numbering)
         scheduler.start()
         log.info(
             "Еженедельная сводка: %s, следующая отправка %s",
