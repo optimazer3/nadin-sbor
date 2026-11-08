@@ -17,7 +17,7 @@ from typing import Any
 
 import openai
 
-from bot.dates import WEEKDAY_FULL, calendar_hint
+from bot.dates import WEEKDAY_CODES, WEEKDAY_FULL, calendar_hint
 from bot.models import LIST_FILTERS, Action, ActionType, Status, Task
 
 log = logging.getLogger(__name__)
@@ -41,6 +41,11 @@ clear_deadline = true.
 - show_tasks — показать список задач. filter: active (по умолчанию), archive (выполненные и \
 отменённые), all. Если просят задачи конкретного человека — assignee.
 - show_dashboard — показать дашборд, сводку, отчёт по задачам.
+- set_schedule — поменять день и время, когда бот сам присылает еженедельную сводку \
+(«присылай сводку по пятницам в 9 утра», «сводку в понедельник в 8:30», «отчёт на час позже»). \
+Поля: weekday (mon, tue, wed, thu, fri, sat, sun) и time (ЧЧ:ММ, 24 часа). Если меняют только \
+день или только время — второе поле возьми из текущего расписания. «Утра» — до 12, \
+«вечера» — +12 часов, «в 9» без уточнения — 09:00.
 - unclear — просят изменить, удалить или открыть задачу, но непонятно какую (подходит \
 несколько задач или ни одной). В task_ids — подходящие задачи (если есть), в question — \
 короткий уточняющий вопрос.
@@ -70,11 +75,11 @@ clear_deadline = true.
 пустой список.
 {team_block}
 Ответь только JSON-объектом, без пояснений, строго в таком формате:
-{{"actions": [{{"type": "create|update|delete|open_task|show_tasks|show_dashboard|unclear", \
+{{"actions": [{{"type": "create|update|delete|open_task|show_tasks|show_dashboard|set_schedule|unclear", \
 "task_ids": [номера], "title": "строка или null", "assignee": "строка или null", \
 "deadline": "YYYY-MM-DD или null", "status": "new|in_progress|on_hold|done|cancelled или null", \
 "clear_assignee": false, "clear_deadline": false, "filter": "active|archive|all или null", \
-"question": "строка или null"}}]}}"""
+"question": "строка или null", "weekday": "mon…sun или null", "time": "ЧЧ:ММ или null"}}]}}"""
 
 _TEAM_BLOCK = """
 Состав команды: {members}.
@@ -82,15 +87,6 @@ _TEAM_BLOCK = """
 ошибка распознавания: «Ване», «Машке», «Лёше») — запиши его имя ровно так, как оно указано \
 в составе команды. Если человека нет в списке — запиши имя как услышал, в именительном падеже.
 """
-
-_SYSTEM_DATE = """\
-Пользователь пишет срок выполнения задачи на русском языке. Определи дату по календарю \
-из сообщения. «До пятницы» / «в пятницу» — ближайшая пятница после сегодняшнего дня; \
-«к концу недели» — пятница текущей недели (если она уже прошла или сегодня — пятница \
-следующей); «через неделю» — сегодня + 7 дней; «к концу месяца» — последний день месяца.
-
-Ответь только JSON-объектом, без пояснений: {"deadline": "YYYY-MM-DD"} \
-или {"deadline": null}, если дату понять нельзя."""
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
@@ -153,6 +149,20 @@ def _clean(value: Any) -> str | None:
     return value.strip()
 
 
+def _parse_time(value: Any) -> str | None:
+    """«9:00», «09.30», «9» → «09:00» / «09:30»; иначе None."""
+    text = _clean(value)
+    if not text:
+        return None
+    match = re.fullmatch(r"(\d{1,2})(?:[:.](\d{2}))?", text)
+    if not match:
+        return None
+    hours, minutes = int(match[1]), int(match[2] or 0)
+    if hours > 23 or minutes > 59:
+        return None
+    return f"{hours:02d}:{minutes:02d}"
+
+
 def _ids(value: Any) -> list[int]:
     result: list[int] = []
     for item in value if isinstance(value, list) else []:
@@ -212,6 +222,19 @@ def _to_actions(items: list[Any], known_ids: set[int]) -> list[Action]:
             actions.append(Action(kind, assignee=action.assignee, filter=action.filter or "active"))
         elif kind == ActionType.SHOW_DASHBOARD:
             actions.append(Action(kind))
+        elif kind == ActionType.SET_SCHEDULE:
+            weekday = (_clean(item.get("weekday")) or "").lower()
+            at = _parse_time(item.get("time"))
+            if weekday in WEEKDAY_CODES and at:
+                actions.append(Action(kind, weekday=weekday, time=at))
+            else:
+                actions.append(
+                    Action(
+                        ActionType.UNCLEAR,
+                        question="Не понял, в какой день и во сколько присылать сводку. "
+                        "Скажите, например: «по пятницам в 9 утра».",
+                    )
+                )
         else:  # unclear
             actions.append(Action(kind, task_ids=ids[:8], question=action.question))
     return actions
@@ -275,7 +298,12 @@ class TaskParser:
         return _extract_json(text)
 
     async def interpret(
-        self, text: str, today: date, tasks: Sequence[Task] = (), focus_id: int | None = None
+        self,
+        text: str,
+        today: date,
+        tasks: Sequence[Task] = (),
+        focus_id: int | None = None,
+        schedule: str | None = None,
     ) -> list[Action]:
         """Понимает, что хочет руководитель: создать, изменить, удалить, показать задачи.
 
@@ -283,6 +311,7 @@ class TaskParser:
         """
         user = (
             f"{_context(today)}\n\n{_tasks_block(tasks, focus_id)}\n\n"
+            f"Еженедельная сводка сейчас приходит: {schedule or 'не настроено'}.\n\n"
             f"Сообщение руководителя:\n<message>\n{text}\n</message>"
         )
         data = await self._ask(self._system_interpret, user)
@@ -290,9 +319,3 @@ class TaskParser:
         if not isinstance(actions, list):
             raise TaskParserError("В ответе нейросети нет списка действий")
         return _to_actions(actions, known_ids={t.id for t in tasks})
-
-    async def parse_date(self, text: str, today: date) -> date | None:
-        """Понимает срок на естественном языке («к концу месяца», «через две недели»)."""
-        user = f"{_context(today)}\n\nСрок:\n<deadline>\n{text}\n</deadline>"
-        data = await self._ask(_SYSTEM_DATE, user)
-        return _parse_iso(data.get("deadline"))

@@ -131,3 +131,20 @@ def test_env_file_encodings(clean_env, encoding):
 def test_env_file_missing(clean_env):
     with pytest.raises(ConfigError, match="Не найден файл .env"):
         load_settings()
+
+
+def test_reminder_schedule_file(env, tmp_path):
+    from bot.scheduler import ReminderService
+
+    settings = load_settings(env_file=None)
+    path = tmp_path / "data" / "schedule.json"
+    reminder = ReminderService(settings, path=path)
+    assert reminder.schedule.describe() == "каждый понедельник в 10:00"  # из .env
+    reminder.set("wed", time(18, 30))
+    assert ReminderService(settings, path=path).schedule.describe() == "каждую среду в 18:30"
+    assert reminder.next_run().weekday() == 2
+
+    path.write_text("испорчено", encoding="utf-8")
+    assert ReminderService(settings, path=path).schedule.describe() == "каждый понедельник в 10:00"
+    with pytest.raises(ValueError):
+        reminder.set("пятница", time(9, 0))

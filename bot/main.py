@@ -24,7 +24,7 @@ from bot.focus import FocusStore
 from bot.handlers import get_routers
 from bot.middlewares import AdminOnlyMiddleware
 from bot.repository import SupabaseTaskRepository
-from bot.scheduler import setup_scheduler
+from bot.scheduler import ReminderService, setup_scheduler
 from bot.services.task_parser import TaskParser
 from bot.services.transcriber import AssemblyAITranscriber, TranscriptionError
 from bot.supabase_key import WHERE, inspect_key, project_ref
@@ -169,19 +169,24 @@ async def main() -> None:
         )
         log.info("Нейросеть: модель %s через %s", settings.llm_model, settings.llm_base_url)
 
-        dp = build_dispatcher(settings, repo=repo, transcriber=transcriber, parser=parser, focus=FocusStore())
+        reminder = ReminderService(settings)
+        dp = build_dispatcher(
+            settings, repo=repo, transcriber=transcriber, parser=parser, focus=FocusStore(), reminder=reminder
+        )
 
-        scheduler = setup_scheduler(bot, repo, settings)
+        scheduler = setup_scheduler(bot, repo, settings, reminder)
         scheduler.start()
-        job = scheduler.get_job("weekly_dashboard")
-        log.info("Еженедельный дашборд: следующая отправка %s", job.next_run_time if job else "—")
+        log.info(
+            "Еженедельная сводка: %s, следующая отправка %s",
+            reminder.schedule.describe(),
+            reminder.next_run(),
+        )
 
         await bot.set_my_commands(
             [
-                BotCommand(command="tasks", description="Список задач"),
-                BotCommand(command="dashboard", description="Дашборд активных задач"),
-                BotCommand(command="cancel", description="Отменить текущее действие"),
-                BotCommand(command="help", description="Как пользоваться"),
+                BotCommand(command="start", description="Как пользоваться"),
+                BotCommand(command="tasks", description="Задачи"),
+                BotCommand(command="dashboard", description="Сводка"),
             ]
         )
 

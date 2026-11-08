@@ -128,11 +128,14 @@ class ActionType(StrEnum):
     OPEN_TASK = "open_task"  # показать карточку задачи
     SHOW_TASKS = "show_tasks"  # показать список (можно по исполнителю)
     SHOW_DASHBOARD = "show_dashboard"
+    SET_SCHEDULE = "set_schedule"  # поменять день и время еженедельной сводки
     UNCLEAR = "unclear"  # непонятно, о какой задаче речь — переспросить
 
 
 # Действия, которые меняют данные: перед ними бот спрашивает «Я правильно понял?».
-MUTATING_ACTIONS = frozenset({ActionType.CREATE, ActionType.UPDATE, ActionType.DELETE})
+MUTATING_ACTIONS = frozenset(
+    {ActionType.CREATE, ActionType.UPDATE, ActionType.DELETE, ActionType.SET_SCHEDULE}
+)
 
 LIST_FILTERS = ("active", "archive", "all")
 
@@ -149,6 +152,8 @@ class Action:
     clear_deadline: bool = False
     filter: str | None = None  # для show_tasks: active / archive / all
     question: str | None = None  # для unclear: что переспросить
+    weekday: str | None = None  # для set_schedule: mon … sun
+    time: str | None = None  # для set_schedule: «ЧЧ:ММ»
 
     @property
     def is_mutating(self) -> bool:
@@ -195,6 +200,8 @@ class Action:
             clear_deadline=bool(data.get("clear_deadline")),
             filter=data.get("filter"),
             question=data.get("question"),
+            weekday=data.get("weekday"),
+            time=data.get("time"),
         )
 
     @classmethod

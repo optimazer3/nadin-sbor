@@ -203,11 +203,22 @@ async def test_errors(llm, reply, message):
         await parser.interpret("x", TODAY)
 
 
-async def test_parse_date(llm):
-    parser, fake = await llm('{"deadline": "2026-11-30"}', '{"deadline": null}')
-    assert await parser.parse_date("к концу месяца", TODAY) == date(2026, 11, 30)
-    assert await parser.parse_date("когда-нибудь", TODAY) is None
-    assert "к концу месяца" in fake.requests[0]["messages"][1]["content"]
+async def test_set_schedule(llm):
+    parser, fake = await llm(
+        reply(
+            {"type": "set_schedule", "weekday": "FRI", "time": "9:00"},
+            {"type": "set_schedule", "weekday": "fri", "time": "25:00"},
+            {"type": "set_schedule", "weekday": "пятница", "time": "09:00"},
+        )
+    )
+    ok, bad_time, bad_day = await parser.interpret(
+        "сводку по пятницам в 9", TODAY, schedule="каждый понедельник в 10:00"
+    )
+    assert (ok.type, ok.weekday, ok.time) == (ActionType.SET_SCHEDULE, "fri", "09:00")
+    assert bad_time.type == bad_day.type == ActionType.UNCLEAR
+    user = fake.requests[0]["messages"][1]["content"]
+    assert "Еженедельная сводка сейчас приходит: каждый понедельник в 10:00" in user
+    assert "set_schedule" in fake.requests[0]["messages"][0]["content"]
 
 
 def test_extract_json_variants():

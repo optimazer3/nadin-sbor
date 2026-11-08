@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date
 from html import escape
 
-from bot.dates import WEEKDAY_SHORT, format_date, format_date_short, relative_deadline
+from bot.dates import WEEKDAY_EVERY, WEEKDAY_SHORT, format_date, format_date_short, relative_deadline
 from bot.models import ACTIVE_STATUSES, Action, ActionType, Status, Task, TaskDraft
 
 TELEGRAM_LIMIT = 4000  # реальный предел 4096, оставляем запас
@@ -26,7 +26,7 @@ def _deadline_text(deadline: date | None, today: date) -> str:
 def draft_text(drafts: Sequence[TaskDraft], today: date, recognized: str | None) -> str:
     parts: list[str] = []
     if recognized:
-        parts.append(f"🎧 <b>Распознано:</b>\n<i>«{escape(recognized)}»</i>\n")
+        parts.append(f"🎧 Вы сказали: <i>«{escape(recognized)}»</i>\n")
     if len(drafts) == 1:
         parts.append("Я правильно понял задачу?\n")
     else:
@@ -43,7 +43,7 @@ def draft_text(drafts: Sequence[TaskDraft], today: date, recognized: str | None)
 
 def task_card(task: Task, today: date) -> str:
     lines = [
-        f"<b>Задача #{task.id}</b>",
+        f"<b>Задача №{task.id}</b>",
         "",
         f"📝 {escape(task.title)}",
         f"👤 Исполнитель: {escape(task.assignee) if task.assignee else 'не указан'}",
@@ -72,40 +72,42 @@ def _deadline_marker(deadline: date | None, today: date, active: bool) -> str:
     return text
 
 
-def task_button_text(task: Task, today: date) -> str:
-    """Короткая строка для кнопки в списке (Telegram обрезает длинные кнопки)."""
-    title = task.title if len(task.title) <= 40 else task.title[:39] + "…"
-    extra = []
-    if task.assignee:
-        extra.append(task.assignee.split(",")[0].strip())
+LIST_HINT = (
+    "Чтобы изменить задачу, назовите её номер, например:\n"
+    "<i>«задача {n} выполнена»</i>, <i>«перенеси задачу {n} на пятницу»</i>, <i>«удали задачу {n}»</i>."
+)
+
+
+def _list_item(task: Task, today: date) -> str:
+    details = [f"👤 {escape(task.assignee)}" if task.assignee else "👤 исполнитель не указан"]
     if task.deadline:
-        extra.append(format_date_short(task.deadline, today))
-    tail = f" · {' · '.join(extra)}" if extra else ""
-    overdue = "❗" if task.is_active and task.deadline and task.deadline < today else ""
-    return f"{task.status.emoji}{overdue} #{task.id} {title}{tail}"
+        details.append(f"📅 {_deadline_marker(task.deadline, today, task.is_active)}")
+    details.append(task.status.display)
+    return f"<b>№{task.id}</b>  {escape(task.title)}\n      " + " · ".join(details)
 
 
-def list_header(filter_title: str, total: int, page: int, pages: int) -> str:
-    if total == 0:
-        return f"📋 <b>{filter_title}</b>\n\nЗадач нет."
-    page_info = f" · стр. {page + 1}/{pages}" if pages > 1 else ""
-    return (
-        f"📋 <b>{filter_title}</b> — {total}{page_info}\n\n"
-        "Нажмите на задачу, чтобы открыть её и изменить статус, текст, исполнителя или срок."
-    )
+def task_list_messages(tasks: Sequence[Task], today: date, title: str) -> list[str]:
+    """Список задач простым текстом — без кнопок, с номерами для голосовых команд."""
+    if not tasks:
+        return [f"{title}\n\nЗадач нет."]
+    items = sorted(tasks, key=_sort_key)
+    blocks = [f"{title} — {len(items)}"]
+    blocks += [_list_item(t, today) for t in items]
+    blocks.append(LIST_HINT.format(n=items[0].id))
+    return split_message(blocks)
 
 
 def _dashboard_line(task: Task, today: date) -> str:
     marker = _deadline_marker(task.deadline, today, active=True)
     tail = f" · {marker}" if marker else ""
-    return f"{task.status.emoji} #{task.id} {escape(task.title)}{tail}"
+    return f"{task.status.emoji} №{task.id} {escape(task.title)}{tail}"
 
 
 def _sort_key(task: Task) -> tuple:
     return (task.deadline is None, task.deadline or date.max, task.id)
 
 
-def dashboard(tasks: Sequence[Task], today: date, title: str = "📊 <b>Дашборд задач</b>") -> list[str]:
+def dashboard(tasks: Sequence[Task], today: date, title: str = "📊 <b>Сводка по задачам</b>") -> list[str]:
     """Сводка активных задач. Возвращает список сообщений (длинный дашборд режется на части)."""
     active = [t for t in tasks if t.status in ACTIVE_STATUSES]
     header = f"{title} — {WEEKDAY_SHORT[today.weekday()]}, {today:%d.%m.%Y}"
@@ -189,16 +191,10 @@ def _split_block(block: str, limit: int) -> list[str]:
     return pieces
 
 
-STATUS_CHANGED = {
-    Status.NEW: "Статус: новая",
-    Status.IN_PROGRESS: "Статус: в работе",
-    Status.ON_HOLD: "Статус: на паузе",
-    Status.DONE: "Задача выполнена ✅",
-    Status.CANCELLED: "Задача отменена",
-}
-
-
 # ---------- голосовые команды: «Я правильно понял?» и итог ----------
+
+
+ANSWER_HINT = "\n\nОтветьте «да» или «нет» — голосом или кнопкой."
 
 
 def _short_deadline(deadline: date | None) -> str:
@@ -207,7 +203,7 @@ def _short_deadline(deadline: date | None) -> str:
 
 def _task_ref(task_id: int, tasks_by_id: Mapping[int, Task]) -> str:
     task = tasks_by_id.get(task_id)
-    return f"#{task_id} «{escape(task.title)}»" if task else f"#{task_id}"
+    return f"№{task_id} «{escape(task.title)}»" if task else f"№{task_id}"
 
 
 def _change_lines(action: Action, task: Task | None) -> list[str]:
@@ -234,11 +230,11 @@ def plan_text(
 ) -> str:
     """Что бот собирается сделать — показывается с кнопками «Да, сохранить» / «Нет»."""
     if all(a.type == ActionType.CREATE for a in actions):
-        return draft_text([a.draft() for a in actions], today, recognized)
+        return draft_text([a.draft() for a in actions], today, recognized) + ANSWER_HINT
 
     parts: list[str] = []
     if recognized:
-        parts.append(f"🎧 <b>Распознано:</b>\n<i>«{escape(recognized)}»</i>\n")
+        parts.append(f"🎧 Вы сказали: <i>«{escape(recognized)}»</i>\n")
     parts.append("Я правильно понял?\n")
     items: list[str] = []
     for action in actions:
@@ -253,28 +249,31 @@ def plan_text(
             for task_id in action.task_ids:
                 head = f"✏️ <b>Изменить задачу</b> {_task_ref(task_id, tasks_by_id)}"
                 items.append("\n".join([head, *_change_lines(action, tasks_by_id.get(task_id))]))
+        elif action.type == ActionType.SET_SCHEDULE:
+            when = WEEKDAY_EVERY.get(action.weekday or "", action.weekday or "")
+            items.append(f"⏰ <b>Присылать сводку</b> {when} в {action.time}")
         elif action.type == ActionType.DELETE:
             for task_id in action.task_ids:
                 items.append(f"🗑 <b>Удалить задачу</b> {_task_ref(task_id, tasks_by_id)}")
     numbered = len(items) > 1
     for i, item in enumerate(items, 1):
         parts.append(f"<b>{i}.</b> {item}\n" if numbered else f"{item}\n")
-    return "\n".join(parts).rstrip()
+    return "\n".join(parts).rstrip() + ANSWER_HINT
 
 
 def apply_result_text(lines: Sequence[str], created: Sequence[Task], only_creates: bool) -> str:
     if only_creates and created and len(lines) == len(created):
         head = "✅ Задача сохранена" if len(created) == 1 else f"✅ Сохранено задач: {len(created)}"
-        return head + "\n\n" + "\n".join(f"#{t.id} {escape(t.title)}" for t in created)
+        return head + "\n\n" + "\n".join(f"№{t.id} {escape(t.title)}" for t in created)
     return "✅ Готово\n\n" + "\n".join(lines)
 
 
 HELP_COMMANDS = (
-    "Голосом или текстом можно:\n"
-    "• создать задачу — <i>«Марии обновить прайс до среды»</i>\n"
-    "• сменить статус — <i>«задача пять выполнена»</i>, <i>«отчёт Ивана в работу»</i>\n"
-    "• перенести срок — <i>«перенеси прайс на пятницу»</i>\n"
-    "• сменить исполнителя — <i>«отдай звонок клиенту Алексею»</i>\n"
-    "• удалить — <i>«удали задачу про воду»</i>\n"
-    "• посмотреть — <i>«покажи задачи Марии»</i>, <i>«покажи дашборд»</i>, <i>«открой задачу семь»</i>"
+    "• <i>«Ивану подготовить отчёт до пятницы»</i> — новая задача\n"
+    "• <i>«Задача 5 выполнена»</i> — сменить статус\n"
+    "• <i>«Перенеси задачу 5 на понедельник»</i> — новый срок\n"
+    "• <i>«Отдай задачу 5 Марии»</i> — другой исполнитель\n"
+    "• <i>«Удали задачу 5»</i>\n"
+    "• <i>«Покажи задачи Ивана»</i>, <i>«покажи сводку»</i>\n"
+    "• <i>«Присылай сводку по пятницам в 9 утра»</i>"
 )

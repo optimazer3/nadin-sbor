@@ -22,10 +22,6 @@ def today_in(tz: ZoneInfo) -> date:
     return datetime.now(tz).date()
 
 
-def has_audio(message: Message) -> bool:
-    return bool(message.voice or message.audio or message.video_note)
-
-
 async def transcribe_message(message: Message, bot: Bot, transcriber: AssemblyAITranscriber) -> str:
     media = message.voice or message.audio or message.video_note
     if media is None:

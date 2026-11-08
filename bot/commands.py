@@ -5,10 +5,15 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import time
 from html import escape
+from typing import TYPE_CHECKING
 
 from bot.models import Action, ActionType, Task
 from bot.repository import TaskRepository
+
+if TYPE_CHECKING:
+    from bot.scheduler import ReminderService
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +24,7 @@ class ApplyResult:
     created: list[Task] = field(default_factory=list)
     updated: list[Task] = field(default_factory=list)
     deleted: list[int] = field(default_factory=list)
+    schedule_changed: bool = False
     errors: int = 0
 
     @property
@@ -31,7 +37,7 @@ class ApplyResult:
 
     @property
     def nothing_done(self) -> bool:
-        return not (self.created or self.updated or self.deleted)
+        return not (self.created or self.updated or self.deleted or self.schedule_changed)
 
 
 def match_team(name: str | None, team: Sequence[str]) -> str | None:
@@ -74,6 +80,7 @@ async def apply_plan(
     source: str,
     raw_text: str | None,
     created_by: int | None,
+    reminder: ReminderService | None = None,
 ) -> ApplyResult:
     """Выполняет действия по порядку. Ошибка в одном действии не мешает остальным."""
     result = ApplyResult()
@@ -88,9 +95,21 @@ async def apply_plan(
             result.lines.append("⚠️ Не удалось создать новые задачи — ошибка базы данных")
         else:
             result.created.extend(created)
-            result.lines.extend(f"➕ Создана #{t.id} «{escape(t.title)}»" for t in created)
+            result.lines.extend(f"➕ Создана №{t.id} «{escape(t.title)}»" for t in created)
 
     for action in actions:
+        if action.type == ActionType.SET_SCHEDULE and reminder is not None:
+            try:
+                hours, minutes = (action.time or "").split(":")
+                reminder.set(action.weekday or "", time(int(hours), int(minutes)))
+            except (ValueError, OSError):
+                log.exception("Не удалось поменять расписание сводки")
+                result.errors += 1
+                result.lines.append("⚠️ Не удалось поменять время сводки")
+            else:
+                result.schedule_changed = True
+                result.lines.append(f"⏰ Сводка будет приходить {reminder.schedule.describe()}")
+            continue
         if action.type not in (ActionType.UPDATE, ActionType.DELETE):
             continue
         for task_id in action.task_ids:
@@ -98,20 +117,20 @@ async def apply_plan(
                 if action.type == ActionType.UPDATE:
                     task = await repo.update(task_id, **action.changes())
                     if task is None:
-                        result.lines.append(f"⚠️ Задача #{task_id} не найдена — возможно, её уже удалили")
+                        result.lines.append(f"⚠️ Задача №{task_id} не найдена — возможно, её уже удалили")
                         continue
                     result.updated.append(task)
                     summary = _change_summary(action, task)
-                    result.lines.append(f"✏️ #{task.id} «{escape(task.title)}»: {summary}")
+                    result.lines.append(f"✏️ №{task.id} «{escape(task.title)}»: {summary}")
                 else:
                     task = await repo.get(task_id)
                     if task is None or not await repo.delete(task_id):
-                        result.lines.append(f"⚠️ Задача #{task_id} не найдена — возможно, её уже удалили")
+                        result.lines.append(f"⚠️ Задача №{task_id} не найдена — возможно, её уже удалили")
                         continue
                     result.deleted.append(task_id)
-                    result.lines.append(f"🗑 Удалена #{task_id} «{escape(task.title)}»")
+                    result.lines.append(f"🗑 Удалена №{task_id} «{escape(task.title)}»")
             except Exception:
                 log.exception("Не удалось выполнить %s для задачи %s", action.type, task_id)
                 result.errors += 1
-                result.lines.append(f"⚠️ Задача #{task_id}: ошибка базы данных, попробуйте ещё раз")
+                result.lines.append(f"⚠️ Задача №{task_id}: ошибка базы данных, попробуйте ещё раз")
     return result
