@@ -9,10 +9,15 @@ from typing import Any, Protocol
 from postgrest.types import CountMethod
 from supabase import AsyncClient
 
-from bot.models import Status, Task, TaskDraft
+from bot.models import ARCHIVE_STATUSES, Status, Task, TaskDraft
 
 # Пометка «поле не меняем» для update(): None означает «очистить поле».
 UNSET: Any = object()
+
+
+def _escape_like(value: str) -> str:
+    """Экранирует спецсимволы шаблона LIKE, чтобы имя искалось как есть."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class TaskRepository(Protocol):
@@ -23,10 +28,12 @@ class TaskRepository(Protocol):
     async def get(self, task_id: int) -> Task | None: ...
 
     async def list(
-        self, statuses: Sequence[Status] | None, *, limit: int, offset: int
+        self, statuses: Sequence[Status] | None, *, limit: int, offset: int, assignee: str | None = None
     ) -> tuple[list[Task], int]: ...
 
     async def list_active(self) -> list[Task]: ...
+
+    async def list_recent_archived(self, limit: int) -> list[Task]: ...
 
     async def update(
         self,
@@ -96,11 +103,13 @@ class SupabaseTaskRepository:
         return Task.from_row(resp.data[0]) if resp.data else None
 
     async def list(
-        self, statuses: Sequence[Status] | None, *, limit: int, offset: int
+        self, statuses: Sequence[Status] | None, *, limit: int, offset: int, assignee: str | None = None
     ) -> tuple[list[Task], int]:
         query = self._t().select("*", count=CountMethod.exact)
         if statuses:
             query = query.in_("status", [Status(s).value for s in statuses])
+        if assignee:
+            query = query.ilike("assignee", f"%{_escape_like(assignee)}%")
         query = (
             query.order("deadline", nullsfirst=False).order("id", desc=True).range(offset, offset + limit - 1)
         )
@@ -120,6 +129,18 @@ class SupabaseTaskRepository:
             offset += page
             if not batch or offset >= total:
                 return tasks
+
+    async def list_recent_archived(self, limit: int) -> list[Task]:
+        """Недавно выполненные и отменённые задачи (чтобы можно было сказать «верни в работу»)."""
+        resp = await (
+            self._t()
+            .select("*")
+            .in_("status", [s.value for s in ARCHIVE_STATUSES])
+            .order("updated_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return [Task.from_row(r) for r in resp.data]
 
     async def update(
         self,
@@ -177,9 +198,11 @@ class InMemoryTaskRepository:
         return self.tasks.get(task_id)
 
     async def list(
-        self, statuses: Sequence[Status] | None, *, limit: int, offset: int
+        self, statuses: Sequence[Status] | None, *, limit: int, offset: int, assignee: str | None = None
     ) -> tuple[list[Task], int]:
         items = [t for t in self.tasks.values() if not statuses or t.status in statuses]
+        if assignee:
+            items = [t for t in items if t.assignee and assignee.lower() in t.assignee.lower()]
         items.sort(key=lambda t: -t.id)
         items.sort(key=lambda t: (t.deadline is None, t.deadline or date.max))
         return items[offset : offset + limit], len(items)
@@ -187,6 +210,11 @@ class InMemoryTaskRepository:
     async def list_active(self) -> list[Task]:
         items, _ = await self.list([Status.NEW, Status.IN_PROGRESS, Status.ON_HOLD], limit=10**9, offset=0)
         return items
+
+    async def list_recent_archived(self, limit: int) -> list[Task]:
+        items = [t for t in self.tasks.values() if t.status in ARCHIVE_STATUSES]
+        items.sort(key=lambda t: t.id, reverse=True)
+        return items[:limit]
 
     async def update(
         self,

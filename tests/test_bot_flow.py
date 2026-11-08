@@ -21,10 +21,11 @@ from aiogram.methods import (
 from aiogram.types import CallbackQuery, Chat, File, Message, Update, User, Voice
 
 from bot.config import Settings
+from bot.focus import FocusStore
 from bot.handlers import get_routers
 from bot.keyboards import BTN_TASKS, DraftCb, ListCb, TaskCb
 from bot.main import build_dispatcher
-from bot.models import Status, TaskDraft
+from bot.models import Action, ActionType, Status, TaskDraft
 from bot.repository import InMemoryTaskRepository
 from bot.scheduler import send_weekly_reminder
 from bot.services.task_parser import TaskParserError
@@ -89,17 +90,29 @@ class FakeTranscriber:
 
 
 class FakeParser:
+    """Вместо нейросети: по умолчанию «понимает» сообщение как создание задач из self.drafts.
+
+    Чтобы проверить команды, задайте self.actions — тогда вернутся они.
+    """
+
     def __init__(self):
         self.drafts = [TaskDraft("Подготовить отчёт", "Иван", date(2026, 11, 13))]
+        self.actions: list[Action] | None = None
         self.fail = False
         self.date_answer: date | None = None
         self.texts: list[str] = []
+        self.contexts: list[list[int]] = []
+        self.focus_ids: list[int | None] = []
 
-    async def parse_tasks(self, text: str, today: date):
+    async def interpret(self, text: str, today: date, tasks=(), focus_id=None):
         self.texts.append(text)
+        self.contexts.append([t.id for t in tasks])
+        self.focus_ids.append(focus_id)
         if self.fail:
             raise TaskParserError("нет связи")
-        return list(self.drafts)
+        if self.actions is not None:
+            return [Action.from_dict(a.to_dict()) for a in self.actions]
+        return [Action.create(d) for d in self.drafts]
 
     async def parse_date(self, text: str, today: date):
         return self.date_answer
@@ -135,7 +148,8 @@ def env():
     repo = InMemoryTaskRepository()
     transcriber = FakeTranscriber()
     parser = FakeParser()
-    dp = build_dispatcher(settings, repo=repo, transcriber=transcriber, parser=parser)
+    focus = FocusStore()
+    dp = build_dispatcher(settings, repo=repo, transcriber=transcriber, parser=parser, focus=focus)
 
     class Env:
         pass
@@ -150,6 +164,7 @@ def env():
         parser,
         dp,
     )
+    e.focus = focus
     e._uid = count(1)
     e._mid = count(1)
 
@@ -226,7 +241,7 @@ async def test_voice_confirm_save_flow(env):
     # Повторное нажатие на ту же кнопку не создаёт дубль.
     await env.press(DraftCb(action="save").pack(), draft_msg)
     assert len(env.repo.tasks) == 1
-    assert "неактуален" in env.session.toasts()[-1]
+    assert "неактуально" in env.session.toasts()[-1]
 
 
 async def test_cancel_draft_and_stale_buttons(env):
@@ -259,7 +274,8 @@ async def test_parser_failure_falls_back_to_raw_text(env):
 async def test_no_tasks_found(env):
     env.parser.drafts = []
     await env.send("привет")
-    assert "Не нашёл в сообщении задачу" in env.session.last_text()
+    assert "Не понял, что нужно сделать" in env.session.last_text()
+    assert "удалить" in env.session.last_text()  # подсказка с примерами команд
 
 
 async def test_multiple_tasks_saved(env):
@@ -382,3 +398,166 @@ async def test_dashboard_button_and_weekly_reminder(env):
     assert last.chat_id == ADMIN
     assert "Еженедельный дашборд" in last.text
     assert last.reply_markup.inline_keyboard[0][0].callback_data == ListCb(f="active", p=0).pack()
+
+
+# ---------- голосовые команды ----------
+
+
+async def _two_tasks(env):
+    report = await _create(env, "Подготовить отчёт", "Иван", date(2026, 11, 13))
+    price = await _create(env, "Обновить прайс", "Мария", date(2026, 11, 11))
+    return report, price
+
+
+async def test_voice_status_change_with_confirmation(env):
+    report, _ = await _two_tasks(env)
+    env.parser.actions = [Action(ActionType.UPDATE, task_ids=[report.id], status=Status.DONE)]
+    env.transcriber.text = "отчёт Ивана готов"
+    await env.send(voice=True)
+
+    # Нейросети передали текущие задачи; пока ничего не изменено — ждём подтверждения.
+    assert sorted(env.parser.contexts[-1]) == [1, 2]
+    text = env.session.last_text()
+    assert "Распознано" in text and "Я правильно понял?" in text
+    assert f"Изменить задачу</b> #{report.id} «Подготовить отчёт»" in text
+    assert "📌 Статус: 🆕 Новая → ✅ Выполнена" in text
+    assert env.repo.tasks[report.id].status == Status.NEW
+
+    await env.press(DraftCb(action="save").pack(), last_bot_message_id(env.session))
+    assert env.repo.tasks[report.id].status == Status.DONE
+    result = env.session.last_text()
+    assert result.startswith("✅ Готово") and "статус → ✅ Выполнена" in result
+    assert env.focus.get(ADMIN) == report.id  # теперь «эта задача» — отчёт
+
+
+async def test_voice_update_deadline_and_assignee_shows_old_and_new(env):
+    _, price = await _two_tasks(env)
+    env.parser.actions = [
+        Action(ActionType.UPDATE, task_ids=[price.id], deadline=date(2026, 11, 20), assignee="иван")
+    ]
+    await env.send("перенеси прайс на 20 ноября и отдай Ивану")
+    text = env.session.last_text()
+    assert "👤 Исполнитель: Мария → Иван" in text  # имя приведено к написанию из команды
+    assert "📅 Срок: 11.11.2026 (ср) → 20.11.2026 (пт)" in text
+    await env.press(DraftCb(action="save").pack(), last_bot_message_id(env.session))
+    task = env.repo.tasks[price.id]
+    assert (task.assignee, task.deadline) == ("Иван", date(2026, 11, 20))
+
+
+async def test_voice_delete_needs_confirmation_and_cancel_keeps_task(env):
+    report, price = await _two_tasks(env)
+    env.parser.actions = [Action(ActionType.DELETE, task_ids=[price.id])]
+    await env.send("удали задачу про прайс")
+    assert f"🗑 <b>Удалить задачу</b> #{price.id} «Обновить прайс»" in env.session.last_text()
+
+    await env.press(DraftCb(action="cancel").pack(), last_bot_message_id(env.session))
+    assert price.id in env.repo.tasks
+    assert "ничего не изменил" in env.session.last_text()
+
+    await env.send("удали задачу про прайс")
+    await env.press(DraftCb(action="save").pack(), last_bot_message_id(env.session))
+    assert price.id not in env.repo.tasks and report.id in env.repo.tasks
+    assert f"🗑 Удалена #{price.id} «Обновить прайс»" in env.session.last_text()
+
+
+async def test_voice_mixed_create_update_delete(env):
+    report, price = await _two_tasks(env)
+    env.parser.actions = [
+        Action(ActionType.CREATE, title="Позвонить клиенту", assignee="Мария"),
+        Action(ActionType.UPDATE, task_ids=[report.id], status=Status.IN_PROGRESS),
+        Action(ActionType.DELETE, task_ids=[price.id]),
+    ]
+    await env.send("Маше позвонить клиенту, отчёт в работу, прайс удали")
+    text = env.session.last_text()
+    assert "<b>1.</b> ➕ <b>Новая задача</b>" in text and "<b>3.</b> 🗑" in text
+    await env.press(DraftCb(action="save").pack(), last_bot_message_id(env.session))
+    titles = {t.title for t in env.repo.tasks.values()}
+    assert titles == {"Подготовить отчёт", "Позвонить клиенту"}
+    assert env.repo.tasks[report.id].status == Status.IN_PROGRESS
+    result = env.session.last_text()
+    assert "➕ Создана #3 «Позвонить клиенту»" in result and "🗑 Удалена #2" in result
+
+
+async def test_focus_from_opened_card_is_passed_to_parser(env):
+    report, _ = await _two_tasks(env)
+    await env.press(TaskCb(action="open", id=report.id).pack(), 5000)
+    env.parser.actions = [Action(ActionType.DELETE, task_ids=[report.id])]
+    await env.send("удали её")
+    assert env.parser.focus_ids[-1] == report.id
+    await env.press(DraftCb(action="save").pack(), last_bot_message_id(env.session))
+    assert env.focus.get(ADMIN) is None  # удалённая задача больше не «открыта»
+
+
+async def test_task_deleted_between_question_and_confirmation(env):
+    report, _ = await _two_tasks(env)
+    env.parser.actions = [Action(ActionType.UPDATE, task_ids=[report.id], status=Status.DONE)]
+    await env.send("отчёт готов")
+    plan_msg = last_bot_message_id(env.session)
+    await env.repo.delete(report.id)
+    await env.press(DraftCb(action="save").pack(), plan_msg)
+    assert "не найдена" in env.session.last_text()
+
+
+async def test_voice_show_commands_run_immediately(env):
+    report, price = await _two_tasks(env)
+
+    env.parser.actions = [Action(ActionType.SHOW_DASHBOARD)]
+    await env.send("покажи дашборд")
+    assert "Дашборд задач" in env.session.last_text()
+
+    env.parser.actions = [Action(ActionType.SHOW_TASKS, assignee="Мария", filter="active")]
+    await env.send("покажи задачи Марии")
+    text = env.session.last_text()
+    assert "Активные задачи — Мария" in text
+    opened = [b[1] for b in env.session.buttons()]
+    assert TaskCb(action="open", id=price.id).pack() in opened
+    assert TaskCb(action="open", id=report.id).pack() not in opened
+
+    env.parser.actions = [Action(ActionType.OPEN_TASK, task_ids=[report.id])]
+    await env.send("открой задачу один")
+    assert f"Задача #{report.id}" in env.session.last_text()
+    assert env.focus.get(ADMIN) == report.id
+    assert all(r.status == Status.NEW for r in env.repo.tasks.values())  # ничего не изменилось
+
+
+async def test_unclear_offers_candidates(env):
+    report, price = await _two_tasks(env)
+    env.parser.actions = [
+        Action(ActionType.UNCLEAR, task_ids=[report.id, price.id], question="Какую задачу закрыть?")
+    ]
+    await env.send("закрой задачу")
+    text = env.session.last_text()
+    assert "Какую задачу закрыть?" in text
+    buttons = [b[1] for b in env.session.buttons()]
+    assert TaskCb(action="open", id=report.id).pack() in buttons
+    assert ListCb(f="active", p=0).pack() in buttons
+    assert all(t.status == Status.NEW for t in env.repo.tasks.values())
+
+
+async def test_show_command_keeps_pending_plan(env):
+    report, _ = await _two_tasks(env)
+    env.parser.actions = [Action(ActionType.UPDATE, task_ids=[report.id], status=Status.DONE)]
+    await env.send("отчёт готов")
+    plan_msg = last_bot_message_id(env.session)
+    env.parser.actions = [Action(ActionType.SHOW_DASHBOARD)]
+    await env.send("покажи дашборд")
+    await env.press(DraftCb(action="save").pack(), plan_msg)  # план всё ещё можно подтвердить
+    assert env.repo.tasks[report.id].status == Status.DONE
+
+
+async def test_db_failure_keeps_plan_for_retry(env, monkeypatch):
+    original = env.repo.create_many
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(env.repo, "create_many", broken)
+    await env.send("Купить воду")
+    plan_msg = last_bot_message_id(env.session)
+    await env.press(DraftCb(action="save").pack(), plan_msg)
+    assert "Не удалось сохранить" in env.session.toasts()[-1]
+    assert env.repo.tasks == {}
+
+    monkeypatch.setattr(env.repo, "create_many", original)
+    await env.press(DraftCb(action="save").pack(), plan_msg)  # та же кнопка ещё работает
+    assert len(env.repo.tasks) == 1

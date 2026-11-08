@@ -20,6 +20,7 @@ from postgrest.exceptions import APIError
 from supabase import AsyncClientOptions, acreate_client
 
 from bot.config import ConfigError, Settings, load_settings
+from bot.focus import FocusStore
 from bot.handlers import get_routers
 from bot.middlewares import AdminOnlyMiddleware
 from bot.repository import SupabaseTaskRepository
@@ -168,7 +169,7 @@ async def main() -> None:
         )
         log.info("Нейросеть: модель %s через %s", settings.llm_model, settings.llm_base_url)
 
-        dp = build_dispatcher(settings, repo=repo, transcriber=transcriber, parser=parser)
+        dp = build_dispatcher(settings, repo=repo, transcriber=transcriber, parser=parser, focus=FocusStore())
 
         scheduler = setup_scheduler(bot, repo, settings)
         scheduler.start()

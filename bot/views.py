@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 from html import escape
 
 from bot.dates import WEEKDAY_SHORT, format_date, format_date_short, relative_deadline
-from bot.models import ACTIVE_STATUSES, Status, Task, TaskDraft
+from bot.models import ACTIVE_STATUSES, Action, ActionType, Status, Task, TaskDraft
 
 TELEGRAM_LIMIT = 4000  # реальный предел 4096, оставляем запас
 
@@ -196,3 +196,85 @@ STATUS_CHANGED = {
     Status.DONE: "Задача выполнена ✅",
     Status.CANCELLED: "Задача отменена",
 }
+
+
+# ---------- голосовые команды: «Я правильно понял?» и итог ----------
+
+
+def _short_deadline(deadline: date | None) -> str:
+    return format_date(deadline) if deadline else "не указан"
+
+
+def _task_ref(task_id: int, tasks_by_id: Mapping[int, Task]) -> str:
+    task = tasks_by_id.get(task_id)
+    return f"#{task_id} «{escape(task.title)}»" if task else f"#{task_id}"
+
+
+def _change_lines(action: Action, task: Task | None) -> list[str]:
+    """Строки «было → стало» для изменения задачи."""
+    lines = []
+    if action.title:
+        lines.append(f"📝 Текст → «{escape(action.title)}»")
+    if action.clear_assignee or action.assignee:
+        old = escape(task.assignee) if task and task.assignee else "не указан"
+        new = escape(action.assignee) if action.assignee and not action.clear_assignee else "убрать"
+        lines.append(f"👤 Исполнитель: {old} → {new}")
+    if action.clear_deadline or action.deadline:
+        old = _short_deadline(task.deadline) if task else "?"
+        new = format_date(action.deadline) if action.deadline and not action.clear_deadline else "убрать"
+        lines.append(f"📅 Срок: {old} → {new}")
+    if action.status:
+        old = task.status.display if task else "?"
+        lines.append(f"📌 Статус: {old} → {action.status.display}")
+    return lines
+
+
+def plan_text(
+    actions: Sequence[Action], tasks_by_id: Mapping[int, Task], today: date, recognized: str | None
+) -> str:
+    """Что бот собирается сделать — показывается с кнопками «Да, сохранить» / «Нет»."""
+    if all(a.type == ActionType.CREATE for a in actions):
+        return draft_text([a.draft() for a in actions], today, recognized)
+
+    parts: list[str] = []
+    if recognized:
+        parts.append(f"🎧 <b>Распознано:</b>\n<i>«{escape(recognized)}»</i>\n")
+    parts.append("Я правильно понял?\n")
+    items: list[str] = []
+    for action in actions:
+        if action.type == ActionType.CREATE:
+            items.append(
+                "➕ <b>Новая задача</b>\n"
+                f"📝 {escape(action.title or '')}\n"
+                f"👤 Исполнитель: {escape(action.assignee) if action.assignee else 'не указан'}\n"
+                f"📅 Дедлайн: {_deadline_text(action.deadline, today)}"
+            )
+        elif action.type == ActionType.UPDATE:
+            for task_id in action.task_ids:
+                head = f"✏️ <b>Изменить задачу</b> {_task_ref(task_id, tasks_by_id)}"
+                items.append("\n".join([head, *_change_lines(action, tasks_by_id.get(task_id))]))
+        elif action.type == ActionType.DELETE:
+            for task_id in action.task_ids:
+                items.append(f"🗑 <b>Удалить задачу</b> {_task_ref(task_id, tasks_by_id)}")
+    numbered = len(items) > 1
+    for i, item in enumerate(items, 1):
+        parts.append(f"<b>{i}.</b> {item}\n" if numbered else f"{item}\n")
+    return "\n".join(parts).rstrip()
+
+
+def apply_result_text(lines: Sequence[str], created: Sequence[Task], only_creates: bool) -> str:
+    if only_creates and created and len(lines) == len(created):
+        head = "✅ Задача сохранена" if len(created) == 1 else f"✅ Сохранено задач: {len(created)}"
+        return head + "\n\n" + "\n".join(f"#{t.id} {escape(t.title)}" for t in created)
+    return "✅ Готово\n\n" + "\n".join(lines)
+
+
+HELP_COMMANDS = (
+    "Голосом или текстом можно:\n"
+    "• создать задачу — <i>«Марии обновить прайс до среды»</i>\n"
+    "• сменить статус — <i>«задача пять выполнена»</i>, <i>«отчёт Ивана в работу»</i>\n"
+    "• перенести срок — <i>«перенеси прайс на пятницу»</i>\n"
+    "• сменить исполнителя — <i>«отдай звонок клиенту Алексею»</i>\n"
+    "• удалить — <i>«удали задачу про воду»</i>\n"
+    "• посмотреть — <i>«покажи задачи Марии»</i>, <i>«покажи дашборд»</i>, <i>«открой задачу семь»</i>"
+)

@@ -12,8 +12,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
+from bot.commands import match_team
 from bot.config import Settings
 from bot.dates import parse_date_simple
+from bot.focus import FocusStore
 from bot.keyboards import (
     BTN_TASKS,
     FILTERS,
@@ -63,6 +65,26 @@ async def render_list(repo: TaskRepository, settings: Settings, f: str, page: in
     return list_header(title, total, page, pages), list_keyboard(tasks, today, f, page, pages)
 
 
+PERSON_LIMIT = 30
+
+
+async def render_person_list(repo: TaskRepository, settings: Settings, assignee: str, f: str = "active"):
+    """Задачи одного исполнителя (по голосовой команде «покажи задачи Марии»)."""
+    if f not in FILTERS:
+        f = "active"
+    title, statuses = FILTERS[f]
+    tasks, total = await repo.list(statuses, limit=PERSON_LIMIT, offset=0, assignee=assignee)
+    today = today_in(settings.timezone)
+    text = list_header(f"{title} — {escape(assignee)}", total, 0, 1)
+    if total > len(tasks):
+        text += f"\n\nПоказаны первые {len(tasks)}."
+    return text, list_keyboard(tasks, today, f, 0, 1)
+
+
+def card_view(task: Task, settings: Settings, f: str = "active", p: int = 0):
+    return task_card(task, today_in(settings.timezone)), card_keyboard(task, f, p)
+
+
 @router.message(Command("tasks"))
 @router.message(F.text == BTN_TASKS)
 async def show_tasks(message: Message, state: FSMContext, repo: TaskRepository, settings: Settings) -> None:
@@ -89,9 +111,17 @@ async def on_list(
 
 
 async def _show_card(
-    callback: CallbackQuery, task: Task, settings: Settings, f: str, p: int, toast: str | None = None
+    callback: CallbackQuery,
+    task: Task,
+    settings: Settings,
+    focus: FocusStore,
+    f: str,
+    p: int,
+    toast: str | None = None,
 ) -> None:
-    await safe_edit(callback.message, task_card(task, today_in(settings.timezone)), card_keyboard(task, f, p))
+    text, kb = card_view(task, settings, f, p)
+    await safe_edit(callback.message, text, kb)
+    focus.set(callback.from_user.id, task.id)
     await callback.answer(toast)
 
 
@@ -113,10 +143,11 @@ async def on_open(
     state: FSMContext,
     repo: TaskRepository,
     settings: Settings,
+    focus: FocusStore,
 ) -> None:
     await state.clear()
     if task := await _load(callback, callback_data, repo, settings):
-        await _show_card(callback, task, settings, callback_data.f, callback_data.p)
+        await _show_card(callback, task, settings, focus, callback_data.f, callback_data.p)
 
 
 @router.callback_query(TaskCb.filter(F.action == "status_menu"))
@@ -135,7 +166,11 @@ async def on_status_menu(
 
 @router.callback_query(TaskCb.filter(F.action == "set_status"))
 async def on_set_status(
-    callback: CallbackQuery, callback_data: TaskCb, repo: TaskRepository, settings: Settings
+    callback: CallbackQuery,
+    callback_data: TaskCb,
+    repo: TaskRepository,
+    settings: Settings,
+    focus: FocusStore,
 ) -> None:
     try:
         status = Status(callback_data.v)
@@ -146,7 +181,9 @@ async def on_set_status(
     if task is None:
         await _load(callback, callback_data, repo, settings)
         return
-    await _show_card(callback, task, settings, callback_data.f, callback_data.p, STATUS_CHANGED[status])
+    await _show_card(
+        callback, task, settings, focus, callback_data.f, callback_data.p, STATUS_CHANGED[status]
+    )
 
 
 # ---------- удаление ----------
@@ -169,9 +206,14 @@ async def on_delete(
 
 @router.callback_query(TaskCb.filter(F.action == "delete_yes"))
 async def on_delete_yes(
-    callback: CallbackQuery, callback_data: TaskCb, repo: TaskRepository, settings: Settings
+    callback: CallbackQuery,
+    callback_data: TaskCb,
+    repo: TaskRepository,
+    settings: Settings,
+    focus: FocusStore,
 ) -> None:
     deleted = await repo.delete(callback_data.id)
+    focus.drop(callback.from_user.id, callback_data.id)
     text, kb = await render_list(repo, settings, callback_data.f, callback_data.p)
     await safe_edit(callback.message, text, kb)
     await callback.answer(f"Задача #{callback_data.id} удалена" if deleted else "Задача уже удалена")
@@ -230,6 +272,7 @@ async def on_set_assignee(
     state: FSMContext,
     repo: TaskRepository,
     settings: Settings,
+    focus: FocusStore,
 ) -> None:
     assignee: str | None
     if callback_data.v == "-":
@@ -245,7 +288,9 @@ async def on_set_assignee(
     if task is None:
         await _load(callback, callback_data, repo, settings)
         return
-    await _show_card(callback, task, settings, callback_data.f, callback_data.p, "Исполнитель обновлён")
+    await _show_card(
+        callback, task, settings, focus, callback_data.f, callback_data.p, "Исполнитель обновлён"
+    )
 
 
 @router.callback_query(TaskCb.filter(F.action == "set_deadline"))
@@ -255,6 +300,7 @@ async def on_set_deadline(
     state: FSMContext,
     repo: TaskRepository,
     settings: Settings,
+    focus: FocusStore,
 ) -> None:
     options = deadline_options(today_in(settings.timezone))
     if callback_data.v not in options:
@@ -265,7 +311,7 @@ async def on_set_deadline(
     if task is None:
         await _load(callback, callback_data, repo, settings)
         return
-    await _show_card(callback, task, settings, callback_data.f, callback_data.p, "Срок обновлён")
+    await _show_card(callback, task, settings, focus, callback_data.f, callback_data.p, "Срок обновлён")
 
 
 # ---------- редактирование: ввод текстом или голосом ----------
@@ -290,7 +336,13 @@ async def _read_input(
 
 
 async def _finish_edit(
-    message: Message, bot: Bot, state: FSMContext, task: Task | None, settings: Settings, prefix: str
+    message: Message,
+    bot: Bot,
+    state: FSMContext,
+    task: Task | None,
+    settings: Settings,
+    focus: FocusStore,
+    prefix: str,
 ) -> None:
     data = await state.get_data()
     await state.clear()
@@ -298,6 +350,7 @@ async def _finish_edit(
     if task is None:
         await message.answer("Задача не найдена — возможно, её удалили.")
         return
+    focus.set(message.chat.id, task.id)
     today = today_in(settings.timezone)
     await message.answer(
         prefix + "✅ Сохранено\n\n" + task_card(task, today),
@@ -313,6 +366,7 @@ async def on_title_input(
     repo: TaskRepository,
     transcriber: AssemblyAITranscriber,
     settings: Settings,
+    focus: FocusStore,
 ) -> None:
     text, prefix = await _read_input(message, bot, transcriber)
     if text is None:
@@ -322,14 +376,7 @@ async def on_title_input(
         return
     data = await state.get_data()
     task = await repo.update(data["task_id"], title=text)
-    await _finish_edit(message, bot, state, task, settings, prefix)
-
-
-def _match_team(name: str, team: tuple[str, ...]) -> str:
-    for member in team:
-        if member.lower() == name.lower():
-            return member
-    return name
+    await _finish_edit(message, bot, state, task, settings, focus, prefix)
 
 
 @router.message(EditTask.assignee, _EDIT_INPUT)
@@ -340,6 +387,7 @@ async def on_assignee_input(
     repo: TaskRepository,
     transcriber: AssemblyAITranscriber,
     settings: Settings,
+    focus: FocusStore,
 ) -> None:
     text, prefix = await _read_input(message, bot, transcriber)
     if text is None:
@@ -347,10 +395,10 @@ async def on_assignee_input(
     text = text.rstrip(".!")
     assignee = None if text.lower() in {"", "-", "—", "нет", "никто", "без исполнителя"} else text
     if assignee:
-        assignee = _match_team(assignee, settings.team_members)
+        assignee = match_team(assignee, settings.team_members)
     data = await state.get_data()
     task = await repo.update(data["task_id"], assignee=assignee)
-    await _finish_edit(message, bot, state, task, settings, prefix)
+    await _finish_edit(message, bot, state, task, settings, focus, prefix)
 
 
 @router.message(EditTask.deadline, _EDIT_INPUT)
@@ -362,6 +410,7 @@ async def on_deadline_input(
     transcriber: AssemblyAITranscriber,
     parser: TaskParser,
     settings: Settings,
+    focus: FocusStore,
 ) -> None:
     text, prefix = await _read_input(message, bot, transcriber)
     if text is None:
@@ -384,4 +433,4 @@ async def on_deadline_input(
             return
     data = await state.get_data()
     task = await repo.update(data["task_id"], deadline=deadline)
-    await _finish_edit(message, bot, state, task, settings, prefix)
+    await _finish_edit(message, bot, state, task, settings, focus, prefix)

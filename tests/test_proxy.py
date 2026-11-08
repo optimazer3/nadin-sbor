@@ -235,7 +235,7 @@ async def test_llm_through_proxy(proxy, serve):
                         "finish_reason": "stop",
                         "message": {
                             "role": "assistant",
-                            "content": '{"tasks": [{"title": "A", "assignee": null, "deadline": null}]}',
+                            "content": '{"actions": [{"type": "create", "title": "A"}]}',
                         },
                     }
                 ],
@@ -249,7 +249,7 @@ async def test_llm_through_proxy(proxy, serve):
         api_key="k", base_url=f"http://localhost:{port}/api/v1", http_client=http, max_retries=0
     )
     try:
-        [draft] = await TaskParser(client, model="m").parse_tasks("x", date(2026, 11, 6))
+        [draft] = await TaskParser(client, model="m").interpret("x", date(2026, 11, 6))
     finally:
         await http.aclose()
     assert draft.title == "A"

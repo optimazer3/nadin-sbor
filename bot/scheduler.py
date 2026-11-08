@@ -32,18 +32,29 @@ def _open_list_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+DASHBOARD_TITLE = "📊 <b>Дашборд задач</b>"
+
+
+async def dashboard_messages(
+    repo: TaskRepository, settings: Settings, title: str = DASHBOARD_TITLE
+) -> list[tuple[str, InlineKeyboardMarkup | None]]:
+    """Сообщения дашборда; у последнего — кнопка «Открыть список задач»."""
+    tasks = await repo.list_active()
+    chunks = dashboard(tasks, today_in(settings.timezone), title=title)
+    return [
+        (chunk, _open_list_keyboard() if i == len(chunks) - 1 else None) for i, chunk in enumerate(chunks)
+    ]
+
+
 async def send_dashboard(
     bot: Bot,
     chat_id: int,
     repo: TaskRepository,
     settings: Settings,
-    title: str = "📊 <b>Дашборд задач</b>",
+    title: str = DASHBOARD_TITLE,
 ) -> None:
-    tasks = await repo.list_active()
-    chunks = dashboard(tasks, today_in(settings.timezone), title=title)
-    for i, chunk in enumerate(chunks):
-        last = i == len(chunks) - 1
-        await bot.send_message(chat_id, chunk, reply_markup=_open_list_keyboard() if last else None)
+    for text, kb in await dashboard_messages(repo, settings, title):
+        await bot.send_message(chat_id, text, reply_markup=kb)
 
 
 async def send_weekly_reminder(bot: Bot, repo: TaskRepository, settings: Settings) -> None:
