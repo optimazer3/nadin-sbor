@@ -185,7 +185,7 @@ async def main() -> None:
         scheduler = setup_scheduler(bot, repo, settings, reminder, numbering)
         scheduler.start()
         log.info(
-            "Еженедельная сводка: %s, следующая отправка %s",
+            "Еженедельный список: %s, следующая отправка %s",
             reminder.schedule.describe(),
             reminder.next_run(),
         )
@@ -193,8 +193,7 @@ async def main() -> None:
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Как пользоваться"),
-                BotCommand(command="tasks", description="Задачи"),
-                BotCommand(command="dashboard", description="Сводка"),
+                BotCommand(command="tasks", description="Список задач"),
             ]
         )
 

@@ -66,8 +66,7 @@ async def test_apply_plan_partial_failure_reports_each_action():
     assert result.errors == 1
     assert [t.id for t in result.updated] == [b.id]
     assert repo.tasks[b.id].status == Status.DONE and repo.tasks[a.id].status == Status.NEW
-    assert any("ошибка базы данных" in line for line in result.lines)
-    assert any("№99 не найдена" in line for line in result.lines)
+    assert result.problems == [f"Не получилось изменить задачу {a.id}.", "Задачи 99 уже нет."]
 
 
 async def test_apply_plan_all_failed():

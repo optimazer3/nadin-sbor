@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, time
 from itertools import count
 from zoneinfo import ZoneInfo
@@ -23,13 +24,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bot.config import Settings
 from bot.focus import FocusStore
 from bot.handlers import get_routers
-from bot.keyboards import BTN_DASHBOARD, BTN_TASKS, DraftCb
+from bot.keyboards import BTN_TASKS, DraftCb
 from bot.main import build_dispatcher
 from bot.models import Action, ActionType, Status, TaskDraft
 from bot.numbering import Numbering
 from bot.repository import InMemoryTaskRepository
 from bot.scheduler import ReminderService, send_weekly_reminder
 from bot.services.task_parser import TaskParserError
+from bot.services.transcriber import TranscriptionError
 
 ADMIN = 111
 STRANGER = 999
@@ -228,11 +230,18 @@ def last_bot_message_id(session: FakeSession) -> int:
     return 1000 + sum(isinstance(c, SendMessage) for c in session.calls) - 1
 
 
+EMOJI = re.compile("[\U0001f300-\U0001faff\u2600-\u27bf\u2b00-\u2bff\u23e9-\u23fa]")
+
+
 def inline_buttons(call) -> list[str]:
     markup = call.reply_markup
     if markup is None or not hasattr(markup, "inline_keyboard"):
         return []
     return [b.text for row in markup.inline_keyboard for b in row]
+
+
+def texts(env) -> list[str]:
+    return [c.text for c in env.session.sent()]
 
 
 async def _create(env, title="Отчёт", assignee="Иван", deadline=date(2026, 11, 13)):
@@ -248,7 +257,15 @@ async def _two_tasks(env):
     return report, price
 
 
-# ---------- вход и простота ----------
+@pytest.fixture(autouse=True)
+def no_emoji_anywhere(env):
+    """Во всех сценариях: ни одного смайлика ни в одном сообщении бота."""
+    yield
+    for text in texts(env):
+        assert not EMOJI.search(text or ""), text
+
+
+# ---------- вход ----------
 
 
 async def test_stranger_gets_id_and_no_access(env):
@@ -259,65 +276,34 @@ async def test_stranger_gets_id_and_no_access(env):
     assert env.repo.tasks == {}
 
 
-async def test_start_is_simple(env):
+async def test_start(env):
     await env.send("/start")
     call = env.session.sent()[-1]
-    assert "Просто нажмите на микрофон" in call.text
-    assert "каждый понедельник в 10:00" in call.text
-    # Внизу ровно две большие кнопки, никаких кнопок в самом сообщении.
-    assert [[b.text for b in row] for row in call.reply_markup.keyboard] == [[BTN_TASKS, BTN_DASHBOARD]]
+    assert "Нажмите на микрофон" in call.text and "каждый понедельник в 10:00" in call.text
+    assert [[b.text for b in row] for row in call.reply_markup.keyboard] == [[BTN_TASKS]]
 
 
-async def test_task_list_is_plain_text_with_numbers(env):
+async def test_list_button(env):
     report, price = await _two_tasks(env)
     await env.send(BTN_TASKS)
     call = env.session.sent()[-1]
-    assert "Задачи в работе</b>\nВсего: 2 задачи" in call.text
-    assert "👤 <b>Иван</b> — 1 задача\n\n<b>1.</b> Подготовить отчёт" in call.text
-    assert "👤 <b>Мария</b> — 1 задача\n\n<b>2.</b> Обновить прайс" in call.text
-    assert "«задача 1 выполнена»" in call.text  # подсказка, как сказать
+    assert call.text == (
+        "<b>Задачи на контроле</b>\n\n"
+        "1. Подготовить отчёт\nИван, до 13 ноября\n\n"
+        "2. Обновить прайс\nМария, до 11 ноября"
+    )
     assert inline_buttons(call) == []
 
 
-async def test_numbers_go_in_order_and_mean_what_was_shown(env):
-    # Задачи в базе с «рваными» номерами: 1, 2, 3 — но Мария по алфавиту позже Ивана.
-    maria = await _create(env, "Прайс", "Мария", date(2026, 11, 11))
-    ivan1 = await _create(env, "Отчёт", "Иван", date(2026, 11, 20))
-    ivan2 = await _create(env, "Звонок", "иван", date(2026, 11, 10))
-    await env.send(BTN_TASKS)
-    text = env.session.last_text()
-    assert "👤 <b>Иван</b> — 2 задачи" in text  # «Иван» и «иван» — один человек
-    assert text.index("<b>1.</b> Звонок") < text.index("<b>2.</b> Отчёт") < text.index("<b>3.</b> Прайс")
-
-    # Нейросеть видит задачи под теми же номерами, что и руководитель.
-    env.parser.actions = [Action(ActionType.DELETE, task_ids=[ivan2.id])]
-    await env.send("удали задачу 1")
-    assert env.parser.numbers[-1] == {ivan2.id: 1, ivan1.id: 2, maria.id: 3}
-    assert "🗑 <b>Удалить задачу</b> №1 «Звонок»" in env.session.last_text()
-    await env.send("да")
-    assert "🗑 Удалена №1 «Звонок»" in env.session.last_text()
-
-    # До следующего показа списка номера не «съезжают»: Отчёт так и остаётся №2.
-    env.parser.actions = [Action(ActionType.UPDATE, task_ids=[ivan1.id], status=Status.DONE)]
-    await env.send("задача 2 выполнена")
-    assert "№2 «Отчёт»" in env.session.last_text()
-    await env.send("нет")
-
-    # Новый показ списка — снова 1, 2…
-    await env.send(BTN_TASKS)
-    assert "<b>1.</b> Отчёт" in env.session.last_text()
-
-
-# ---------- создание ----------
+# ---------- добавление ----------
 
 
 async def test_voice_create_confirm_with_button(env):
     await env.send(voice=True)
     assert env.transcriber.audio == [b"OGG-AUDIO"]
     call = env.session.sent()[-1]
-    assert "Вы сказали" in call.text and "Подготовить отчёт" in call.text
-    assert "Ответьте «да» или «нет»" in call.text
-    assert inline_buttons(call) == ["✅ Да", "❌ Нет"]
+    assert call.text == "Добавить задачу?\n\nПодготовить отчёт\nИван, до 13 ноября"
+    assert inline_buttons(call) == ["Да", "Нет"]
     plan_msg = last_bot_message_id(env.session)
 
     await env.press(DraftCb(action="save").pack(), plan_msg)
@@ -328,8 +314,9 @@ async def test_voice_create_confirm_with_button(env):
         date(2026, 11, 13),
         "voice",
     )
-    assert "✅ Задача сохранена" in env.session.last_text()
-    assert inline_buttons(env.session.sent()[-1]) == []
+    # «Готово.» — и сразу обновлённый список.
+    assert texts(env)[-2] == "Готово."
+    assert texts(env)[-1] == "<b>Задачи на контроле</b>\n\n1. Подготовить отчёт\nИван, до 13 ноября"
 
     await env.press(DraftCb(action="save").pack(), plan_msg)  # повторное нажатие — без дубля
     assert len(env.repo.tasks) == 1
@@ -343,9 +330,8 @@ async def test_confirm_by_voice_yes(env, answer):
     env.transcriber.text = answer
     await env.send(voice=True)
     assert len(env.repo.tasks) == 1
-    assert "✅ Задача сохранена" in env.session.last_text()
+    assert texts(env)[-2] == "Готово."
     assert env.parser.texts == ["Ване подготовить отчёт до пятницы"]  # «да» нейросеть не спрашивали
-    # У вопроса «Я правильно понял?» кнопки убраны.
     assert any(isinstance(c, EditMessageReplyMarkup) and c.message_id == plan_msg for c in env.session.calls)
 
 
@@ -354,9 +340,8 @@ async def test_cancel_by_voice_no(env):
     env.transcriber.text = "Нет"
     await env.send(voice=True)
     assert env.repo.tasks == {}
-    assert "ничего не сохраняю" in env.session.last_text()
-    # После «нет» бот снова в обычном режиме: «да» уже ничего не подтверждает.
-    env.transcriber.text = "да"
+    assert env.session.last_text() == "Хорошо, ничего не меняю."
+    env.transcriber.text = "да"  # после «нет» «да» уже ничего не подтверждает
     env.parser.drafts = []
     await env.send(voice=True)
     assert env.repo.tasks == {}
@@ -366,21 +351,21 @@ async def test_no_with_correction_is_a_new_command(env):
     await env.send("Ивану отчёт")
     env.parser.drafts = [TaskDraft("Подготовить отчёт", "Иван", date(2026, 11, 11))]
     await env.send("нет, срок до среды")
-    assert env.parser.texts[-1] == "нет, срок до среды"  # ушло в нейросеть как новая команда
-    assert "11.11.2026" in env.session.last_text()
+    assert env.parser.texts[-1] == "нет, срок до среды"
+    assert "до 11 ноября" in env.session.last_text()
 
 
 async def test_cancel_by_button(env):
     await env.send("Купить воду")
     await env.press(DraftCb(action="cancel").pack(), last_bot_message_id(env.session))
     assert env.repo.tasks == {}
-    assert "<code>Купить воду</code>" in env.session.last_text()
+    assert env.session.last_text() == "Хорошо, ничего не меняю."
 
 
 async def test_parser_failure_falls_back_to_raw_text(env):
     env.parser.fail = True
     await env.send("Купить воду в офис")
-    assert "запишу его как новую задачу" in env.session.last_text()
+    assert env.session.last_text() == "Добавить задачу?\n\nКупить воду в офис"
     await env.send("да")
     assert env.repo.tasks[1].title == "Купить воду в офис"
 
@@ -388,69 +373,94 @@ async def test_parser_failure_falls_back_to_raw_text(env):
 async def test_nothing_understood(env):
     env.parser.drafts = []
     await env.send("привет")
-    text = env.session.last_text()
-    assert "Не понял, что нужно сделать" in text and "Задача 5 выполнена" in text
+    assert env.session.last_text() == "Не понял. Скажите ещё раз."
+
+
+async def test_voice_not_heard(env, monkeypatch):
+    async def broken(audio):
+        raise TranscriptionError("timeout")
+
+    monkeypatch.setattr(env.transcriber, "transcribe", broken)
+    await env.send(voice=True)
+    assert env.session.last_text() == "Не расслышал. Скажите ещё раз."
 
 
 async def test_multiple_tasks_saved(env):
     env.parser.drafts = [TaskDraft("A", "Иван"), TaskDraft("B", "Мария")]
     await env.send("Ивану A, Марии B")
-    assert "Задач: 2" in env.session.last_text()
+    assert env.session.last_text() == (
+        "Я правильно понял?\n\n1. Добавить задачу\nA\nИван\n\n2. Добавить задачу\nB\nМария"
+    )
     await env.send("да")
     assert [t.title for t in env.repo.tasks.values()] == ["A", "B"]
-    assert "Сохранено задач: 2" in env.session.last_text()
 
 
-# ---------- изменение и удаление голосом ----------
+# ---------- изменение и удаление ----------
 
 
-async def test_voice_status_change(env):
-    report, _ = await _two_tasks(env)
+async def test_mark_done_leaves_the_list(env):
+    report, price = await _two_tasks(env)
     env.parser.actions = [Action(ActionType.UPDATE, task_ids=[report.id], status=Status.DONE)]
     env.transcriber.text = "задача один выполнена"
     await env.send(voice=True)
     assert sorted(env.parser.contexts[-1]) == [1, 2]
-    text = env.session.last_text()
-    assert f"Изменить задачу</b> №{report.id} «Подготовить отчёт»" in text
-    assert "📌 Статус: 🆕 Новая → ✅ Выполнена" in text
+    assert env.session.last_text() == "Отметить задачу 1 выполненной?\n\nПодготовить отчёт"
     assert env.repo.tasks[report.id].status == Status.NEW  # пока не подтвердили — не меняем
 
     env.transcriber.text = "да"
     await env.send(voice=True)
     assert env.repo.tasks[report.id].status == Status.DONE
-    assert env.session.last_text().startswith("🎧 Вы сказали: <i>«да»</i>")
-    assert "статус → ✅ Выполнена" in env.session.last_text()
-    assert env.focus.get(ADMIN) == report.id
+    assert texts(env)[-1] == "<b>Задачи на контроле</b>\n\n1. Обновить прайс\nМария, до 11 ноября"
 
 
-async def test_voice_update_shows_old_and_new(env):
+async def test_update_shows_old_and_new(env):
     _, price = await _two_tasks(env)
     env.parser.actions = [
         Action(ActionType.UPDATE, task_ids=[price.id], deadline=date(2026, 11, 20), assignee="иван")
     ]
     await env.send("перенеси прайс на 20 ноября и отдай Ивану")
-    text = env.session.last_text()
-    assert "👤 Исполнитель: Мария → Иван" in text
-    assert "📅 Срок: 11.11.2026 (ср) → 20.11.2026 (пт)" in text
+    assert env.session.last_text() == (
+        "Изменить задачу 2?\n\nОбновить прайс\nИсполнитель: Мария → Иван\nСрок: до 11 ноября → до 20 ноября"
+    )
     await env.send("да")
     task = env.repo.tasks[price.id]
     assert (task.assignee, task.deadline) == ("Иван", date(2026, 11, 20))
 
 
-async def test_voice_delete(env):
+async def test_delete(env):
     report, price = await _two_tasks(env)
     env.parser.actions = [Action(ActionType.DELETE, task_ids=[price.id])]
     await env.send("удали задачу два")
-    assert f"🗑 <b>Удалить задачу</b> №{price.id} «Обновить прайс»" in env.session.last_text()
+    assert env.session.last_text() == "Удалить задачу 2?\n\nОбновить прайс"
     await env.send("нет")
     assert price.id in env.repo.tasks
     await env.send("удали задачу два")
     await env.send("да")
     assert price.id not in env.repo.tasks and report.id in env.repo.tasks
-    assert f"🗑 Удалена №{price.id} «Обновить прайс»" in env.session.last_text()
 
 
-async def test_voice_mixed_commands(env):
+async def test_numbers_follow_the_shown_list(env):
+    a = await _create(env, "Первая", "Иван")
+    b = await _create(env, "Вторая", "Мария")
+    c = await _create(env, "Третья", "Иван")
+    await env.send(BTN_TASKS)
+    assert "1. Первая" in env.session.last_text() and "3. Третья" in env.session.last_text()
+
+    env.parser.actions = [Action(ActionType.DELETE, task_ids=[a.id])]
+    await env.send("удали задачу 1")
+    assert env.parser.numbers[-1] == {a.id: 1, b.id: 2, c.id: 3}
+    await env.send("да")
+    # После изменения показан новый список — и номера снова 1, 2.
+    assert texts(env)[-1] == (
+        "<b>Задачи на контроле</b>\n\n1. Вторая\nМария, до 13 ноября\n\n2. Третья\nИван, до 13 ноября"
+    )
+    env.parser.actions = [Action(ActionType.UPDATE, task_ids=[c.id], status=Status.DONE)]
+    await env.send("задача 2 выполнена")
+    assert env.parser.numbers[-1][c.id] == 2
+    assert env.session.last_text() == "Отметить задачу 2 выполненной?\n\nТретья"
+
+
+async def test_mixed_commands(env):
     report, price = await _two_tasks(env)
     env.parser.actions = [
         Action(ActionType.CREATE, title="Позвонить клиенту", assignee="Мария"),
@@ -458,8 +468,12 @@ async def test_voice_mixed_commands(env):
         Action(ActionType.DELETE, task_ids=[price.id]),
     ]
     await env.send("Маше позвонить клиенту, отчёт в работу, прайс удали")
-    text = env.session.last_text()
-    assert "<b>1.</b> ➕ <b>Новая задача</b>" in text and "<b>3.</b> 🗑" in text
+    assert env.session.last_text() == (
+        "Я правильно понял?\n\n"
+        "1. Добавить задачу\nПозвонить клиенту\nМария\n\n"
+        "2. Взять задачу 1 в работу\nПодготовить отчёт\n\n"
+        "3. Удалить задачу 2\nОбновить прайс"
+    )
     await env.send("да")
     assert {t.title for t in env.repo.tasks.values()} == {"Подготовить отчёт", "Позвонить клиенту"}
     assert env.repo.tasks[report.id].status == Status.IN_PROGRESS
@@ -469,8 +483,7 @@ async def test_open_task_then_delete_it(env):
     report, _ = await _two_tasks(env)
     env.parser.actions = [Action(ActionType.OPEN_TASK, task_ids=[report.id])]
     await env.send("открой задачу один")
-    call = env.session.sent()[-1]
-    assert f"Задача №{report.id}" in call.text and inline_buttons(call) == []
+    assert env.session.last_text() == "<b>Задача 1</b>\n\nПодготовить отчёт\nИван, до 13 ноября"
     env.parser.actions = [Action(ActionType.DELETE, task_ids=[report.id])]
     await env.send("удали её")
     assert env.parser.focus_ids[-1] == report.id
@@ -485,41 +498,37 @@ async def test_task_deleted_between_question_and_answer(env):
     await env.send("отчёт готов")
     await env.repo.delete(report.id)
     await env.send("да")
-    assert "не найдена" in env.session.last_text()
+    assert "Задачи 1 уже нет." in env.session.last_text()
 
 
 # ---------- показать ----------
 
 
-async def test_show_commands_run_immediately(env):
+async def test_show_commands(env):
     report, price = await _two_tasks(env)
-
-    env.parser.actions = [Action(ActionType.SHOW_DASHBOARD)]
-    await env.send("покажи сводку")
-    assert "Сводка по задачам" in env.session.last_text()
-    assert "каждый понедельник в 10:00" in env.session.last_text()
+    for kind in (ActionType.SHOW_DASHBOARD, ActionType.SHOW_TASKS):
+        env.parser.actions = [Action(kind)]
+        await env.send("покажи список")
+        assert env.session.last_text().startswith("<b>Задачи на контроле</b>\n\n1. Подготовить отчёт")
 
     env.parser.actions = [Action(ActionType.SHOW_TASKS, assignee="Мария", filter="active")]
     await env.send("покажи задачи Марии")
-    text = env.session.last_text()
-    assert "Задачи в работе</b> — Мария\nВсего: 1 задача" in text
-    assert "Обновить прайс" in text and "Подготовить отчёт" not in text
+    assert env.session.last_text() == "<b>Задачи на контроле</b>\n\n2. Обновить прайс\nМария, до 11 ноября"
 
     env.parser.actions = [Action(ActionType.SHOW_TASKS, filter="archive")]
     await env.send("покажи выполненные")
-    assert "Выполненные и отменённые" in env.session.last_text()
+    assert env.session.last_text() == "<b>Выполненные и отменённые</b>\n\nЗадач нет."
     assert all(t.status == Status.NEW for t in env.repo.tasks.values())
 
 
-async def test_unclear_lists_candidates_as_text(env):
+async def test_unclear_lists_candidates(env):
     report, price = await _two_tasks(env)
     env.parser.actions = [
         Action(ActionType.UNCLEAR, task_ids=[report.id, price.id], question="Какую задачу закрыть?")
     ]
     await env.send("закрой задачу")
     call = env.session.sent()[-1]
-    assert "Какую задачу закрыть?" in call.text
-    assert f"<b>№{report.id}</b>  Подготовить отчёт — Иван" in call.text
+    assert call.text == "Какую задачу закрыть?\n\n1. Подготовить отчёт\n\n2. Обновить прайс"
     assert inline_buttons(call) == []
 
 
@@ -527,55 +536,44 @@ async def test_show_keeps_pending_question(env):
     report, _ = await _two_tasks(env)
     env.parser.actions = [Action(ActionType.UPDATE, task_ids=[report.id], status=Status.DONE)]
     await env.send("отчёт готов")
-    env.parser.actions = [Action(ActionType.SHOW_DASHBOARD)]
-    await env.send("покажи сводку")
-    await env.send("да")  # вопрос «Я правильно понял?» ещё в силе
+    env.parser.actions = [Action(ActionType.SHOW_TASKS)]
+    await env.send("покажи список")
+    await env.send("да")  # вопрос ещё в силе
     assert env.repo.tasks[report.id].status == Status.DONE
 
 
-async def test_dashboard_button(env):
-    await _create(env, "Отчёт", "Иван", date(2020, 1, 1))
-    await env.send(BTN_DASHBOARD)
-    text = env.session.last_text()
-    assert "Сводка по задачам" in text and "просрочено" in text
-    assert inline_buttons(env.session.sent()[-1]) == []
+# ---------- еженедельный список ----------
 
 
-# ---------- расписание сводки ----------
-
-
-async def test_change_dashboard_schedule_by_voice(env):
-    await env.send("Ивану отчёт")  # parser видит текущее расписание
+async def test_change_schedule_by_voice(env):
+    await env.send("Ивану отчёт")
     assert env.parser.schedules[-1] == "каждый понедельник в 10:00"
     await env.send("нет")
 
     env.parser.actions = [Action(ActionType.SET_SCHEDULE, weekday="fri", time="09:00")]
-    await env.send("присылай сводку по пятницам в 9 утра")
-    assert "⏰ <b>Присылать сводку</b> каждую пятницу в 09:00" in env.session.last_text()
-    assert env.reminder.schedule.day == "mon"  # до подтверждения ничего не меняем
+    await env.send("присылай список по пятницам в 9 утра")
+    assert env.session.last_text() == "Присылать список каждую пятницу в 09:00?"
+    assert env.reminder.schedule.day == "mon"
 
     await env.send("да")
     assert (env.reminder.schedule.day, env.reminder.schedule.at) == ("fri", time(9, 0))
-    assert "Сводка будет приходить каждую пятницу в 09:00" in env.session.last_text()
-    # Планировщик переставлен, расписание сохранено в файл.
+    assert env.session.last_text() == "Готово. Список будет приходить каждую пятницу в 09:00."
     trigger = env.scheduler.get_job("weekly_dashboard").trigger
     assert "day_of_week='fri'" in str(trigger) and "hour='9'" in str(trigger)
     assert env.schedule_file.read_text(encoding="utf-8") == '{"day": "fri", "time": "09:00"}'
-
-    # После перезапуска бот берёт расписание из файла, а не из .env.
-    again = ReminderService(env.settings, path=env.schedule_file)
-    assert again.schedule.describe() == "каждую пятницу в 09:00"
-
-    await env.send("/start")
-    assert "каждую пятницу в 09:00" in env.session.last_text()
+    assert (
+        ReminderService(env.settings, path=env.schedule_file).schedule.describe() == "каждую пятницу в 09:00"
+    )
 
 
-async def test_weekly_reminder(env):
+async def test_weekly_list(env):
     await _create(env, "Отчёт", "Иван", date(2020, 1, 1))
-    await send_weekly_reminder(env.bot, env.repo, env.settings, env.reminder)
+    await send_weekly_reminder(env.bot, env.repo, env.settings, env.reminder, env.numbering)
     last = env.session.sent(SendMessage)[-1]
     assert last.chat_id == ADMIN
-    assert "Еженедельная сводка" in last.text and "Чтобы изменить, скажите" in last.text
+    assert re.fullmatch(
+        r"<b>Задачи на контроле на \d+ \w+</b>\n\n1\. Отчёт\nИван, до 1 января 2020", last.text
+    ), last.text
 
 
 # ---------- сбои ----------
@@ -589,18 +587,15 @@ async def test_db_failure_keeps_question_for_retry(env, monkeypatch):
 
     monkeypatch.setattr(env.repo, "create_many", broken)
     await env.send("Купить воду")
-    plan_msg = last_bot_message_id(env.session)
-    await env.press(DraftCb(action="save").pack(), plan_msg)
-    assert "Не получилось сохранить" in env.session.toasts()[-1]
     await env.send("да")
-    assert "Не получилось сохранить" in env.session.last_text()
+    assert env.session.last_text() == "Не получилось сохранить. Скажите «да» ещё раз."
     assert env.repo.tasks == {}
 
     monkeypatch.setattr(env.repo, "create_many", original)
-    await env.send("да")  # можно подтвердить ещё раз
+    await env.send("да")
     assert len(env.repo.tasks) == 1
 
 
-async def test_old_buttons_explain_themselves(env):
+async def test_old_buttons(env):
     await env.press("t:open:5:active:0:", 5000)
     assert "больше не работает" in env.session.toasts()[-1]

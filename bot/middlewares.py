@@ -33,7 +33,7 @@ class AdminOnlyMiddleware(BaseMiddleware):
         log.info("Отказ в доступе: user_id=%s", user.id if user else None)
         if isinstance(event, Message) and user is not None:
             await event.answer(
-                "⛔ Этот бот работает только для руководителя.\n\n"
+                "Этот бот работает только для руководителя.\n\n"
                 f"Ваш Telegram ID: <code>{user.id}</code>\n"
                 "Если это вы — добавьте ID в ADMIN_IDS в файле .env и перезапустите бота."
             )

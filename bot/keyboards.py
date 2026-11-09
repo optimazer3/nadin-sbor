@@ -5,8 +5,7 @@ from __future__ import annotations
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
-BTN_TASKS = "📋 Задачи"
-BTN_DASHBOARD = "📊 Сводка"
+BTN_TASKS = "Список задач"
 
 
 class DraftCb(CallbackData, prefix="d"):
@@ -14,9 +13,9 @@ class DraftCb(CallbackData, prefix="d"):
 
 
 def main_menu() -> ReplyKeyboardMarkup:
-    """Две большие кнопки внизу экрана."""
+    """Одна большая кнопка внизу экрана."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_TASKS), KeyboardButton(text=BTN_DASHBOARD)]],
+        keyboard=[[KeyboardButton(text=BTN_TASKS)]],
         resize_keyboard=True,
         is_persistent=True,
         input_field_placeholder="Нажмите на микрофон и говорите",
@@ -24,12 +23,12 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 
 def draft_keyboard() -> InlineKeyboardMarkup:
-    """«Да» / «Нет» под вопросом «Я правильно понял?»."""
+    """«Да» / «Нет» под вопросом."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Да", callback_data=DraftCb(action="save").pack()),
-                InlineKeyboardButton(text="❌ Нет", callback_data=DraftCb(action="cancel").pack()),
+                InlineKeyboardButton(text="Да", callback_data=DraftCb(action="save").pack()),
+                InlineKeyboardButton(text="Нет", callback_data=DraftCb(action="cancel").pack()),
             ]
         ]
     )

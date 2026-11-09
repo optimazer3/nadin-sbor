@@ -6,7 +6,6 @@ import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import time
-from html import escape
 from typing import TYPE_CHECKING
 
 from bot.models import Action, ActionType, Task
@@ -21,7 +20,7 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class ApplyResult:
-    lines: list[str] = field(default_factory=list)  # что сделано — для сообщения руководителю
+    problems: list[str] = field(default_factory=list)  # что не получилось — показываем руководителю
     created: list[Task] = field(default_factory=list)
     updated: list[Task] = field(default_factory=list)
     deleted: list[int] = field(default_factory=list)
@@ -47,23 +46,6 @@ def normalize_team(actions: Sequence[Action], team: Sequence[str]) -> list[Actio
     return list(actions)
 
 
-def _change_summary(action: Action, task: Task) -> str:
-    parts = []
-    if action.title:
-        parts.append("текст обновлён")
-    if action.clear_assignee:
-        parts.append("исполнитель убран")
-    elif action.assignee:
-        parts.append(f"исполнитель → {escape(task.assignee or '')}")
-    if action.clear_deadline:
-        parts.append("срок убран")
-    elif action.deadline:
-        parts.append(f"срок → {task.deadline:%d.%m.%Y}" if task.deadline else "срок обновлён")
-    if action.status:
-        parts.append(f"статус → {task.status.display}")
-    return ", ".join(parts)
-
-
 async def apply_plan(
     repo: TaskRepository,
     actions: Sequence[Action],
@@ -84,10 +66,9 @@ async def apply_plan(
         except Exception:
             log.exception("Не удалось создать задачи")
             result.errors += 1
-            result.lines.append("⚠️ Не удалось создать новые задачи — ошибка базы данных")
+            result.problems.append("Не получилось добавить задачу.")
         else:
             result.created.extend(created)
-            result.lines.extend(f"➕ Создана №{number(t.id)} «{escape(t.title)}»" for t in created)
 
     for action in actions:
         if action.type == ActionType.SET_SCHEDULE and reminder is not None:
@@ -95,12 +76,11 @@ async def apply_plan(
                 hours, minutes = (action.time or "").split(":")
                 reminder.set(action.weekday or "", time(int(hours), int(minutes)))
             except (ValueError, OSError):
-                log.exception("Не удалось поменять расписание сводки")
+                log.exception("Не удалось поменять расписание списка")
                 result.errors += 1
-                result.lines.append("⚠️ Не удалось поменять время сводки")
+                result.problems.append("Не получилось поменять время списка.")
             else:
                 result.schedule_changed = True
-                result.lines.append(f"⏰ Сводка будет приходить {reminder.schedule.describe()}")
             continue
         if action.type not in (ActionType.UPDATE, ActionType.DELETE):
             continue
@@ -109,24 +89,17 @@ async def apply_plan(
                 if action.type == ActionType.UPDATE:
                     task = await repo.update(task_id, **action.changes())
                     if task is None:
-                        result.lines.append(
-                            f"⚠️ Задача №{number(task_id)} не найдена — возможно, её уже удалили"
-                        )
+                        result.problems.append(f"Задачи {number(task_id)} уже нет.")
                         continue
                     result.updated.append(task)
-                    summary = _change_summary(action, task)
-                    result.lines.append(f"✏️ №{number(task.id)} «{escape(task.title)}»: {summary}")
                 else:
                     task = await repo.get(task_id)
                     if task is None or not await repo.delete(task_id):
-                        result.lines.append(
-                            f"⚠️ Задача №{number(task_id)} не найдена — возможно, её уже удалили"
-                        )
+                        result.problems.append(f"Задачи {number(task_id)} уже нет.")
                         continue
                     result.deleted.append(task_id)
-                    result.lines.append(f"🗑 Удалена №{number(task_id)} «{escape(task.title)}»")
             except Exception:
                 log.exception("Не удалось выполнить %s для задачи %s", action.type, task_id)
                 result.errors += 1
-                result.lines.append(f"⚠️ Задача №{number(task_id)}: ошибка базы данных, попробуйте ещё раз")
+                result.problems.append(f"Не получилось изменить задачу {number(task_id)}.")
     return result

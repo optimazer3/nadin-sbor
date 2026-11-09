@@ -16,25 +16,9 @@ class Status(StrEnum):
     CANCELLED = "cancelled"
 
     @property
-    def emoji(self) -> str:
-        return _STATUS_EMOJI[self]
-
-    @property
     def label(self) -> str:
         return _STATUS_LABEL[self]
 
-    @property
-    def display(self) -> str:  # «🔄 В работе»
-        return f"{self.emoji} {self.label}"
-
-
-_STATUS_EMOJI = {
-    Status.NEW: "🆕",
-    Status.IN_PROGRESS: "🔄",
-    Status.ON_HOLD: "⏸",
-    Status.DONE: "✅",
-    Status.CANCELLED: "❌",
-}
 
 _STATUS_LABEL = {
     Status.NEW: "Новая",
@@ -128,7 +112,7 @@ class ActionType(StrEnum):
     OPEN_TASK = "open_task"  # показать карточку задачи
     SHOW_TASKS = "show_tasks"  # показать список (можно по исполнителю)
     SHOW_DASHBOARD = "show_dashboard"
-    SET_SCHEDULE = "set_schedule"  # поменять день и время еженедельной сводки
+    SET_SCHEDULE = "set_schedule"  # поменять день и время еженедельного списка
     UNCLEAR = "unclear"  # непонятно, о какой задаче речь — переспросить
 
 

@@ -226,7 +226,7 @@ async def test_set_schedule(llm):
     assert (ok.type, ok.weekday, ok.time) == (ActionType.SET_SCHEDULE, "fri", "09:00")
     assert bad_time.type == bad_day.type == ActionType.UNCLEAR
     user = fake.requests[0]["messages"][1]["content"]
-    assert "Еженедельная сводка сейчас приходит: каждый понедельник в 10:00" in user
+    assert "Еженедельный список сейчас приходит: каждый понедельник в 10:00" in user
     assert "set_schedule" in fake.requests[0]["messages"][0]["content"]
 
 
